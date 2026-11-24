@@ -55,6 +55,13 @@ otherwise the model gets `OUTCOME_UNKNOWN` and is told to inspect state. `--mess
 requirement**: it is stored in state and rendered as a `user` message right after the task, pinned like the
 task (compaction validation rejects any change to it; the summarizer receives it verbatim).
 
+**Verification before finishing.** `agent.py --verify "<command>" "<task>"` stores the command in the run
+config (so it survives `--resume`). When the model answers without a tool call, `final_verification` checks
+the protocol, runs the command with a timeout and logs its output. Exit 0 → status `verified`. The first
+failure appends a short diagnostic (`user` message with the output tail) and sends the graph back to
+`context_manager`; a second failure, or an exhausted budget, ends with `verification_failed`. Without
+`--verify` the behaviour is unchanged (`finished`).
+
 ## 3. Dynamic tools and skills
 
 The catalog has 25 tools: 12 working (files, grep, tests, SQLite, JSON, CSV, git) and 13 **synthetic**
@@ -173,7 +180,12 @@ Handle in the harness, deterministically:
 - **non-recoverable**: auth errors stop the run; `PERMISSION_DENIED` (side-effecting external tools, a small
   bash denylist) is reported with `model_can_repair: false`; exhausted budgets (turns, tool calls, tokens,
   wall time) stop with an explicit status; `LOOP_DETECTED` replaces the third identical failing call made
-  without any environment change in between.
+  without any environment change in between (bash is never blocked, only hinted).
+- **repeat hints**: the second identical failure (same tool, same arguments) with no observable change in
+  between gets a hint with the previous error and the id of the previous call. A bash command counts as a
+  change only if the working-tree fingerprint (mtime + size of files, `.git`/caches excluded) changed, so
+  repeated failing commands are no longer hidden by a bumped environment version. Catalog commands
+  (`run_tests`, `grep`, `git_*`) return their exit code, so a failing `run_tests` is `NONZERO_EXIT`, not `OK`.
 
 ## 9. Benchmark methodology
 
@@ -348,8 +360,9 @@ AGENT_MODE=hybrid AGENT_CONTEXT_WINDOW=16000 AGENT_EVICTION_POLICY=fifo \
   uv run --env-file .env python agent.py "<task>"                                # prints 🆔 Run <id>
 uv run --env-file .env python agent.py --resume <id>                             # continue after a stop/crash
 uv run --env-file .env python agent.py --resume <id> --message "new requirement" # late requirement change
+uv run --env-file .env python agent.py --verify "python -m pytest -q" "<task>"   # must pass before done
 
-uv run python -m pytest -q tests                                                # 70 deterministic tests
+uv run python -m pytest -q tests                                                # 79 deterministic tests
 uv run --env-file .env python bench/run.py --label hybrid --mode hybrid --runs 2 \
   [--context-window 16000] [--eviction-policy default|fifo|size]
 uv run --env-file .env python bench/run.py --label original --mode original --runs 2   # provided file

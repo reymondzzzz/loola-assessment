@@ -401,3 +401,23 @@ All five findings were confirmed against the code before fixing; each fix has a 
   (`summary` seed 0, `sed -i … tests/test_store.py`) caught by the independent check.
 - Mistake of mine during the wait: the watcher loops used `pgrep -f "bench/run.py"`, which matched their own
   command line, so they never exited (and looked "stuck"). The runs were fine; the loops were stopped.
+
+## 25. Verification before finishing, structured exit codes, repeat hints (merged branch)
+- Developed on branch `verify-and-repeat-hints` in a separate worktree while the gpt-4.1-mini matrix ran, so
+  that later-starting benchmark processes kept importing the measured code (`896b8ca`); merged afterwards.
+  None of these changes are reflected in the benchmark numbers.
+- `--verify CMD`: stored as `HarnessConfig.verify_command` (in `config.json`, survives resume).
+  `final_verification` runs it after the protocol check (timeout `verify_timeout`, output logged as a
+  `verification` event). Exit 0 → `verified`; first failure → diagnostic `user` message (output tail) and back
+  to `context_manager`; second failure or exhausted budget → `verification_failed`; no command → `finished`.
+- Catalog `run()` returns a `CommandResult` (str with `exit_code`); the executor maps non-zero to
+  `NONZERO_EXIT`. Before, a failing `run_tests` was recorded as `OK`.
+- Bash changed the environment version on every call, even failed no-op ones, so identical failures were never
+  counted. Now the version moves only if the working-tree fingerprint changed (or on timeout/unknown).
+  Failures are keyed by tool + normalized arguments + environment version; the second identical failure gets a
+  hint (previous error, previous call id); bash is hinted, never blocked; other tools keep `LOOP_DETECTED` on
+  the third. A change in between resets the count.
+- Tests: `tests/test_verify.py` (fail → fix → pass; two failures stop; no `--verify` unchanged; command survives
+  resume through the CLI), `tests/test_repeat_hints.py` (run_tests exit codes, bash hint without blocking and
+  reset after a change, failing no-op bash does not bump the version, run_tests hint then LOOP_DETECTED, hint
+  reaches the model through the graph). Not implemented: progress memory in the checkpoint, fixed common tools.
