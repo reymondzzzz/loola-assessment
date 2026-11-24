@@ -63,23 +63,23 @@ def filtered(kind: str, tool: str, text: str) -> str:
     return text
 
 
-def minimal_reference(artifact_id: str) -> str:
-    return f"[artifact {artifact_id}]"
+def minimal_reference(artifact_id: str | None) -> str:
+    return f"[artifact {artifact_id}]" if artifact_id else "[output truncated]"
 
 
 ARTIFACT_ID_LENGTH = 12
 MIN_CALL_BUDGET = count_tokens(minimal_reference("")) + ARTIFACT_ID_LENGTH
 
 
-def head_tail(text: str, budget: int, artifact_id: str, original_tokens: int) -> str:
+def head_tail(text: str, budget: int, artifact_id: str | None, original_tokens: int) -> str:
     if count_tokens(text) <= budget:
         return text
     minimal = minimal_reference(artifact_id)
     lines = text.splitlines()
     if len(lines) < 3:
         lines = [text[i:i + 200] for i in range(0, len(text), 200)]
-    reference = (f"[... {{omitted}} of {len(lines)} lines omitted; original {original_tokens} tokens. "
-                 f"Full output: read_artifact('{artifact_id}', offset, limit) ...]")
+    recovery = f"Full output: read_artifact('{artifact_id}', offset, limit)" if artifact_id else "Output not archived"
+    reference = f"[... {{omitted}} of {len(lines)} lines omitted; original {original_tokens} tokens. {recovery} ...]"
     content_budget = budget - count_tokens(reference.format(omitted=len(lines))) - 2
     if content_budget < 8:
         return minimal
@@ -130,20 +130,24 @@ class OutputProcessor:
             content, tool, arguments = action["content"], action["tool"], action["tool_arguments"]
             kind = observation_kind(tool, arguments)
             digest = hashlib.sha256(content.encode()).hexdigest()
+            artifact_id, original_tokens = None, count_tokens(content)
             if action.get("spill_path"):
-                artifact_id = self.artifacts.save_file(action["spill_path"])
-                digest = artifact_id
-                original_tokens = (self.artifacts.directory / f"{artifact_id}.txt").stat().st_size // 4
-            else:
+                spilled_bytes = Path(action["spill_path"]).stat().st_size
+                original_tokens = spilled_bytes // 4
+                if self.config.artifact_offloading:
+                    artifact_id = digest = self.artifacts.save_file(action["spill_path"])
+                else:
+                    digest = f"unarchived:{spilled_bytes}:{digest}:{action['id']}"
+                    Path(action["spill_path"]).unlink()
+            elif self.config.artifact_offloading:
                 artifact_id = self.artifacts.save(content)
-                original_tokens = count_tokens(content)
             visible, duplicate_of = content, None
             if action["ok"]:
                 if self.config.deduplication and digest in visible_digests:
                     earlier = visible_digests[digest]
                     duplicate_of = earlier["message_id"]
                     visible = (f"[Identical to the output of tool call {earlier['message_id']} (turn "
-                               f"{earlier['created_at_turn']}), which is still above. artifact {artifact_id}]")
+                               f"{earlier['created_at_turn']}), which is still above.]")
                 elif self.config.output_truncation:
                     visible = head_tail(filtered(kind, tool, content), budget, artifact_id, original_tokens)
             path = arguments.get("path") if tool in READ_TOOLS | WRITE_TOOLS else None
@@ -152,7 +156,7 @@ class OutputProcessor:
                            "arguments_tokens": count_tokens(action["arguments"]),
                            "created_at_turn": turn, "last_access_turn": turn, "access_count": 1,
                            "resource_path": path, "resource_version": fingerprint(path) if path else None,
-                           "pinned": tool == "load_skill", "stale": False, "recoverable": True,
+                           "pinned": tool == "load_skill", "stale": False, "recoverable": artifact_id is not None,
                            "digest": digest, "masked": False, "duplicate_of": duplicate_of, "ok": action["ok"], "code": action["code"],
                            "summary": f"{tool} {json.dumps(arguments)[:120]}"}
             observations[action["id"]] = observation

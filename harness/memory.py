@@ -22,7 +22,7 @@ def read_artifact(artifacts: ArtifactStore, artifact_id: str, offset: int = 1, l
     return content if content is not None else f"Error: no artifact '{artifact_id}'."
 
 
-def search_history(events: EventStore, artifacts: ArtifactStore, query: str, limit: int = 5) -> str:
+def search_history(events: EventStore, artifacts: ArtifactStore | None, query: str, limit: int = 5) -> str:
     results = {event["tool_call_id"]: event for event in events.read() if event["kind"] == "tool_result"}
     if not results:
         return "No history yet."
@@ -35,6 +35,6 @@ def search_history(events: EventStore, artifacts: ArtifactStore, query: str, lim
         event = results[call_id]
         preview = " ".join(event["content"].split())[:300]
         lines.append(json.dumps({"tool_call_id": call_id, "turn": event["turn"], "tool": event["name"],
-                                 "arguments": event["arguments"][:200], "artifact_id": event.get("artifact_id") or artifacts.save(event["content"]),
+                                 "arguments": event["arguments"][:200], "artifact_id": event.get("artifact_id") or (artifacts.save(event["content"]) if artifacts else None),
                                  "preview": preview}))
-    return "\n".join(lines) + "\nUse read_artifact(artifact_id) for full content."
+    return "\n".join(lines) + ("\nUse read_artifact(artifact_id) for full content." if artifacts else "")

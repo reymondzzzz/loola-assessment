@@ -303,3 +303,25 @@ All five findings were confirmed against the code before fixing; each fix has a 
 - Tests (`tests/test_eviction_policies.py`): the same history gives three different candidate orders; the
   guards exclude pinned/unrecoverable/small/recent observations under every policy; the policy drives the
   existing masking mechanism (fifo masks the oldest, size the largest); unknown policy names are rejected.
+
+## 20. 2/5: independent optimization flags (§16)
+- Prompt and base tools are now built from the config instead of a mode name:
+  - `lazy_tools`: catalog via discover/describe/invoke (True) or all 25 schemas in `tools[]` (False).
+  - `lazy_skills`: skill L0 metadata in the prompt + `load_skill`/`read_skill_resource` tools (True), or
+    all SKILL.md bodies in the prompt and no skill tools (False) — independent of `lazy_tools`.
+  - `artifact_offloading`:
+    - True: full outputs (and large archived arguments) are saved as artifacts; truncated/masked outputs
+      point to them; `read_artifact` is a base tool.
+    - False: nothing is archived. Output limits still apply (filters, head/tail truncation, shared budget);
+      the truncation marker says "Output not archived" and contains no artifact id; spilled bash output is
+      deleted after the bounded preview; `read_artifact` is not offered; `search_history` returns previews
+      without ids. Observations are unrecoverable, so masking, stale eviction and pruning skip them;
+      emergency reduction drops them with an explicit "not archived" note; validation only checks artifact
+      ids that exist in observations.
+- Presets: eager/lazy/native keep `artifact_offloading=False`; masking/summary/hybrid all use the same
+  output pipeline with offloading on, so they stay comparable. Note: eager/lazy no longer get a
+  `read_artifact` tool (it had nothing to read there), which changes their prefix slightly vs. older runs.
+- Tests (`tests/test_flags.py`): `lazy_skills` toggled alone under both tool modes (prompt bodies vs
+  metadata, skill tools present/absent, tool part unchanged); `artifact_offloading` toggled alone on the
+  masking preset through the full graph — on: every referenced artifact exists and compaction ran; off: no
+  artifact files, no artifact references anywhere, outputs still bounded, run finishes within budget.

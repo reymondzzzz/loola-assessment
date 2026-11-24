@@ -18,7 +18,7 @@ VALID_SUMMARY = {"goal": "fix the bug", "verified_facts": ["code name ORCHID-7"]
 
 
 def history(tmp_path, turns: int, size: int = 400, extra: dict | None = None):
-    processor = OutputProcessor(HarnessConfig(), ArtifactStore(tmp_path))
+    processor = OutputProcessor(HarnessConfig(artifact_offloading=True), ArtifactStore(tmp_path))
     messages, observations = [], {}
     for turn in range(1, turns + 1):
         call_id = f"c{turn}"

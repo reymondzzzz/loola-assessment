@@ -73,6 +73,8 @@ def tool_positions(messages: list[dict]) -> dict[str, int]:
 
 def masked_reference(observation: dict, original: str) -> str:
     status = "ok" if observation["ok"] else f"error {observation['code']}"
+    if not observation["recoverable"]:
+        return f"[Output dropped to fit the context: {observation['summary']} -> {status}; it was not archived.]"
     detail = "" if observation["ok"] else f" Error: {original[:300]}"
     stale = " (stale: resource changed since)" if observation["stale"] else ""
     return (f"[Output archived{stale}: {observation['summary']} -> {status}, {observation['original_tokens']} tokens. "
@@ -157,7 +159,7 @@ class InteractionPruning:
             for call in message.get("tool_calls") or []:
                 arguments = call["function"]["arguments"]
                 tokens = count_tokens(arguments)
-                if tokens > LARGE_ARGUMENT_TOKENS:
+                if tokens > LARGE_ARGUMENT_TOKENS and config.artifact_offloading:
                     artifact_id = self.artifacts.save(arguments)
                     call["function"]["arguments"] = json.dumps({"_archived_arguments": artifact_id, "_tokens": tokens,
                                                                 "_head": arguments[:120]})
@@ -171,7 +173,8 @@ class InteractionPruning:
         for group_start, group_end in interaction_groups(candidate.messages[:start]):
             group = candidate.messages[group_start:group_end]
             call_ids = [m["tool_call_id"] for m in group if m["role"] == "tool"]
-            if removed_tokens >= excess or not group[0].get("tool_calls") or set(call_ids) & pinned_ids:
+            unrecoverable = any(not candidate.observations.get(c, {}).get("recoverable", False) for c in call_ids)
+            if removed_tokens >= excess or not group[0].get("tool_calls") or set(call_ids) & pinned_ids or unrecoverable:
                 kept.extend(group)
                 continue
             removed_tokens += count_messages(group, [])
@@ -269,7 +272,8 @@ class SemanticCompaction:
         candidate.reclaimed[self.name] = candidate.reclaimed.get(self.name, 0) + before - estimate(candidate)
 
 
-def emergency_reduce(candidate: Candidate, budget: int, estimate: Callable[[Candidate], int], artifacts: ArtifactStore) -> bool:
+def emergency_reduce(candidate: Candidate, budget: int, estimate: Callable[[Candidate], int], artifacts: ArtifactStore,
+                     offloading: bool = True) -> bool:
     start = protected_start(candidate.messages, 1)
     positions = tool_positions(candidate.messages)
     for call_id, position in sorted(positions.items(), key=lambda item: item[1]):
@@ -287,8 +291,8 @@ def emergency_reduce(candidate: Candidate, budget: int, estimate: Callable[[Cand
         if estimate(candidate) <= budget:
             break
         if message["role"] == "tool" and count_tokens(message["content"]) > 400:
-            artifact_id = artifacts.save(message["content"])
-            message["content"] = message["content"][:800] + f"\n[truncated in emergency; read_artifact('{artifact_id}')]"
+            recovery = f"read_artifact('{artifacts.save(message['content'])}')" if offloading else "not archived"
+            message["content"] = message["content"][:800] + f"\n[truncated in emergency; {recovery}]"
     return estimate(candidate) <= budget
 
 
@@ -317,7 +321,7 @@ class ContextManager:
         if prompt[1]["content"] != self.task:
             return "task changed"
         for observation in candidate.observations.values():
-            if observation["masked"] and not self.artifacts.exists(observation["artifact_id"]):
+            if observation["masked"] and observation["artifact_id"] and not self.artifacts.exists(observation["artifact_id"]):
                 return f"missing artifact {observation['artifact_id']}"
         return None
 
@@ -343,7 +347,7 @@ class ContextManager:
                 report["summarizer_error"] = strategy.error
                 strategy.error = None
         if estimate(candidate) > budget:
-            emergency_ok = emergency_reduce(candidate, low, estimate, self.artifacts)
+            emergency_ok = emergency_reduce(candidate, low, estimate, self.artifacts, self.config.artifact_offloading)
             report["steps"].append({"strategy": "emergency", "after": estimate(candidate)})
             if not emergency_ok and estimate(candidate) > budget:
                 report["error"] = "context_budget_exceeded"

@@ -45,7 +45,7 @@ def test_catalog_tools_work(tmp_path, monkeypatch):
 
 
 def test_skill_progressive_loading():
-    metadata_prompt = system_prompt("lazy")
+    metadata_prompt = system_prompt(mode_config("lazy"))
     assert "sql-reporting:" in metadata_prompt and "# SQL reporting" not in metadata_prompt
     level1 = registry.load_skill("sql-reporting")
     assert "# SQL reporting" in level1 and "References: references/sqlite-datetime.md" in level1
@@ -56,13 +56,12 @@ def test_skill_progressive_loading():
 
 
 def test_modes_share_one_catalog():
-    eager, lazy = initial_tools("eager"), initial_tools("lazy")
-    assert set(names(eager)) == {"bash", "read_artifact", "search_history", *registry.TOOLS.specs}
-    assert names(lazy) == ["bash", "discover", "describe", "invoke", "load_skill", "read_skill_resource",
-                           "read_artifact", "search_history"]
-    assert "invoke" not in names(initial_tools("native"))
-    assert not any(f"{name}" in system_prompt("lazy") for name in ("sqlite_query", "git_show", "slack_post_message"))
-    assert all(f"# " in system_prompt("eager") for _ in registry.SKILLS.skills)
+    eager, lazy = initial_tools(mode_config("eager")), initial_tools(mode_config("lazy"))
+    assert set(names(eager)) == {"bash", "search_history", *registry.TOOLS.specs}
+    assert names(lazy) == ["bash", "discover", "describe", "invoke", "load_skill", "read_skill_resource", "search_history"]
+    assert "invoke" not in names(initial_tools(mode_config("native")))
+    assert not any(f"{name}" in system_prompt(mode_config("lazy")) for name in ("sqlite_query", "git_show", "slack_post_message"))
+    assert all(f"# " in system_prompt(mode_config("eager")) for _ in registry.SKILLS.skills)
 
 
 def test_native_binding():
@@ -76,12 +75,12 @@ def test_native_binding():
     results = [m for m in llm.requests[3]["messages"] if m["role"] == "tool"]
     assert '"UNKNOWN_TOOL"' in results[0]["content"] and "UNKNOWN_TOOL" not in results[2]["content"]
     _, lazy = run_script(script, mode_config("lazy"))
-    assert all(names(r["tools"]) == names(initial_tools("lazy")) for r in lazy.requests)
+    assert all(names(r["tools"]) == names(initial_tools(mode_config("lazy"))) for r in lazy.requests)
 
 
 def test_lazy_prefix_unchanged_by_discovery():
-    before = json.dumps([system_prompt("lazy"), initial_tools("lazy")])
+    before = json.dumps([system_prompt(mode_config("lazy")), initial_tools(mode_config("lazy"))])
     registry.describe("git_log")
     registry.discover("csv")
     registry.load_skill("csv-parsing")
-    assert json.dumps([system_prompt("lazy"), initial_tools("lazy")]) == before
+    assert json.dumps([system_prompt(mode_config("lazy")), initial_tools(mode_config("lazy"))]) == before

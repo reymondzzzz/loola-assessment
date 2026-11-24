@@ -53,12 +53,6 @@ class Run:
     started: float = field(default_factory=time.monotonic)
 
 
-def mode_name(config: HarnessConfig) -> str:
-    if not config.lazy_tools:
-        return "eager"
-    return "native" if config.native_binding else "lazy"
-
-
 def parsed_arguments(raw: str) -> dict:
     try:
         arguments = json.loads(raw or "{}")
@@ -68,7 +62,7 @@ def parsed_arguments(raw: str) -> dict:
 
 
 def build_request(state: AgentState, config: HarnessConfig) -> list[dict]:
-    return build_prompt(system_prompt(mode_name(config)), state["task"], state["summary"], state["active_messages"])
+    return build_prompt(system_prompt(config), state["task"], state["summary"], state["active_messages"])
 
 
 def to_candidate(state: AgentState) -> Candidate:
@@ -111,7 +105,7 @@ def build_graph(run: Run):
 
     def context_window_manager(state: AgentState) -> ContextManager:
         summarize = lambda request: run.llm.complete(request, [], purpose="summarizer")[0]  # noqa: E731
-        return ContextManager(run.config, run.artifacts, system_prompt(mode_name(run.config)), state["task"],
+        return ContextManager(run.config, run.artifacts, system_prompt(run.config), state["task"],
                               state["active_tools"], summarize, state["completed_actions"])
 
     def compact(state: AgentState, force: bool) -> tuple[dict, dict]:
@@ -190,7 +184,7 @@ def build_graph(run: Run):
         memory_tools = {"read_artifact": (MEMORY_TOOL_SCHEMAS["read_artifact"],
                                           lambda **a: read_artifact(run.artifacts, **a)),
                         "search_history": (MEMORY_TOOL_SCHEMAS["search_history"],
-                                           lambda **a: search_history(run.events, run.artifacts, **a))}
+                                           lambda **a: search_history(run.events, run.artifacts if run.config.artifact_offloading else None, **a))}
         executor = ToolExecutor(available={tool["function"]["name"] for tool in state["active_tools"]},
                                 loop_limit=run.config.loop_limit, extra_tools=memory_tools, **state["executor"])
         results = []
@@ -286,7 +280,7 @@ def build_graph(run: Run):
 
 def initial_state(task: str, config: HarnessConfig) -> AgentState:
     return AgentState(task=task, active_messages=[], summary={}, observations={}, active_skills={},
-                      active_tools=initial_tools(mode_name(config)), completed_actions=[], pending_actions=[],
+                      active_tools=initial_tools(config), completed_actions=[], pending_actions=[],
                       context_epoch=0, status="running", turn=0, request=[], request_tokens=0, calibration=1.0,
                       overflow_attempts=0, response={},
                       executor={"environment_version": 0, "failures": {}})
