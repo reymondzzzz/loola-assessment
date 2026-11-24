@@ -61,3 +61,53 @@ reasons, not the full trajectory. Newest entries at the bottom.
     and judged by "still 11/11, ticket 11 still correct" rather than by savings alone.
   - 91% cache hit is the bar: the new mechanisms must not destroy prefix caching.
   - Token savings from dynamic tool loading need a realistic tool catalog in the "before" variant.
+
+## 8. Requirements update
+- The user supplied a detailed spec (LangGraph harness: context manager cascade, artifact store, error
+  taxonomy, benchmark matrix `original/eager/lazy/masking/summary/hybrid`). It is now the primary source;
+  work proceeds in parts, one commit per part, each with a DEVLOG entry.
+- Baseline frozen: `baseline/original_agent.py` (provided code, byte-identical) and
+  `baseline/langgraph_port.py` (behaviour-preserving port + metrics, commit 370f1fe).
+- Assumption: the provided code cannot run on gpt-6-luna (it sends `temperature`, which the model rejects
+  with HTTP 400). Benchmark mode `original` therefore runs the port, which was verified equivalent to the
+  provided loop by replaying scripted LLM replies. The earlier "baseline" result is relabelled `original`.
+
+## 9. Part 1 — dynamic tools and skills
+- Registry: `harness/catalog.py` (25 tools: 12 working, 13 synthetic with realistic schemas and no backend —
+  they return "not available in this environment"), `ToolSpec` with keywords, read_only, idempotent,
+  timeout, version, max_output_tokens. `harness/registry.py`: `ToolRegistry`, `SkillRegistry`, one BM25
+  index class (stdlib) reused for tools and skills.
+- Modes over the same catalog:
+  - `eager`: bash + all 25 schemas in `tools[]`, all SKILL.md bodies in the system prompt.
+  - `lazy` (static dispatcher): fixed `tools[]` = bash, discover, describe, invoke, load_skill,
+    read_skill_resource. No registry listing in the prompt (spec), only a one-line hint of tool categories
+    and skill L0 metadata (name, description, when to use).
+  - `native` (optional experiment): `describe(name)` appends that schema to `tools[]` for later turns.
+- Why the dispatcher is the default: `tools[]` and the system prompt are the head of the cached prefix.
+  In `lazy` they never change, discovered schemas arrive as tool results (append-only), so the prefix stays
+  byte-identical (`test_lazy_prefix_unchanged_by_discovery`). `native` gets real schema enforcement for
+  discovered tools but every binding rewrites the head of the prompt; measured below.
+- Skills follow Agent Skills layout (`skills/<name>/SKILL.md` + `references/`): L0 metadata in prompt,
+  L1 `load_skill`, L2 `read_skill_resource` (path traversal blocked).
+- Rejected: embedding/hybrid retrieval and hierarchical discovery (25 tools do not need them), intent
+  routing (extra LLM call), skill eviction (rewrites history; handled later by the context manager).
+- Validation: required/unknown/type checks before execution (bool is not accepted as integer).
+- Fixed per-call prefix (measured with a real request, `input_tokens`): original 171, eager 2,887,
+  lazy 576, native 535 (before any binding).
+- Caveat: the skills contain advice relevant to the benchmark tickets, so `original` (no skills) vs
+  `lazy` differs in available information, not only in loading strategy. `eager` vs `lazy` is the clean
+  comparison: same catalog, same skills, different loading.
+- Benchmark, gpt-6-luna, seed 0, 1 run per mode (n=1 — indicative only, turn counts vary run to run):
+
+  | mode | success | turns | input tokens | cached | peak context | tool calls of note |
+  |---|---|---|---|---|---|---|
+  | original | 11/11 | 28 | 259,899 | 91% | 21,555 | bash ×27 |
+  | eager | 11/11 | 51 | 578,172 | 97% | 19,282 | bash 16, edit_file 13, read_file 11, … |
+  | lazy | 11/11 | 39 | 519,976 | 94% | 28,539 | bash 32, load_skill 6, discover 0 |
+  | native | 11/11 | 37 | 290,158 | 94% | 16,858 | — |
+- Findings:
+  - Per-call fixed cost is the clean signal: eager pays ~2.3k tokens more than lazy on every call.
+  - Total tokens are dominated by turn count, which varies with strategy: granular catalog tools in eager led
+    to many small steps (51 turns). In lazy the model ignored the catalog and used bash + skills; loaded
+    skill bodies raised its peak context. n=1 cannot separate these effects from noise.
+  - No quality regression: every mode closed all 11 tickets including the recall ticket.

@@ -6,6 +6,8 @@ sys.path.insert(0, str(BENCH_DIR.parent))
 import agent  # noqa: E402
 from generate import make_workdir  # noqa: E402
 from tickets import TICKETS, VISIBLE_TESTS_DIR  # noqa: E402
+from baseline import langgraph_port  # noqa: E402
+from harness.prompt import TOOL_MODES  # noqa: E402
 
 RUNS_DIR = BENCH_DIR / "runs"
 RESULTS_FILE = BENCH_DIR / "results.jsonl"
@@ -43,7 +45,7 @@ def score(workdir: Path, state: dict, protected_digest: dict[str, str]) -> dict:
             "success": all(final_checks) and tests_untouched and data_untouched}
 
 
-def run_once(label: str, seed: int) -> dict:
+def run_once(label: str, seed: int, tool_mode: str) -> dict:
     workdir, bad_commit = make_workdir(seed)
     state_dir = Path(tempfile.mkdtemp(prefix="bench-state-"))
     state_path = state_dir / "state.json"
@@ -56,12 +58,12 @@ def run_once(label: str, seed: int) -> dict:
     os.chdir(workdir)
     with open(RUNS_DIR / f"{label}-seed{seed}.log", "w") as log, contextlib.redirect_stdout(log):
         try:
-            metrics = agent.agent_loop(TASK)
+            metrics = langgraph_port.agent_loop(TASK) if tool_mode == "original" else agent.agent_loop(TASK, tool_mode)
         except Exception as error:  # a crashed run is a failed run, not a crashed benchmark
             print(f"\n💥 {type(error).__name__}: {error}")
             metrics = {"stop_reason": f"crash: {type(error).__name__}"}
     os.chdir(original_cwd)
-    result = {"label": label, "model": agent.LLM_MODEL, "seed": seed, "wall_seconds": round(time.monotonic() - started, 1),
+    result = {"label": label, "tool_mode": tool_mode, "model": agent.LLM_MODEL, "seed": seed, "wall_seconds": round(time.monotonic() - started, 1),
               **metrics, **score(workdir, json.loads(state_path.read_text()), protected_digest)}
     shutil.rmtree(workdir)
     shutil.rmtree(state_dir)
@@ -72,10 +74,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True)
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--tool-mode", choices=("original", *TOOL_MODES), default="original")
     args = parser.parse_args()
-    agent.MAX_TURNS = BENCH_MAX_TURNS
+    agent.MAX_TURNS = langgraph_port.MAX_TURNS = BENCH_MAX_TURNS
     for seed in range(args.runs):
-        result = run_once(args.label, seed)
+        result = run_once(args.label, seed, args.tool_mode)
         with open(RESULTS_FILE, "a") as f:
             f.write(json.dumps(result) + "\n")
         print(json.dumps(result))

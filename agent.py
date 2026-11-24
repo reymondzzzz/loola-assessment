@@ -1,41 +1,18 @@
-"""Minimal coding agent loop — one tool: bash."""
+"""Coding agent harness with dynamic tool and skill loading (modes: eager | lazy | native)."""
 import json, operator, os, sys, subprocess
 from typing import Annotated, Literal, TypedDict
 
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
+from harness.prompt import TOOL_MODES, initial_tools, system_prompt
+from harness.registry import META_HANDLERS, TOOLS, run_catalog_tool, spec_tool
+
 
 LLM_BASE_URL = os.environ["LLM_BASE_URL"]
 LLM_API_KEY = os.environ["LLM_API_KEY"]
 LLM_MODEL = os.environ["LLM_MODEL"]
 MAX_TURNS = 1000
-
-SYSTEM_PROMPT = """\
-You are a coding agent. Your job is to help the user with programming tasks.
-
-You have access to ONE tool: `bash` — which executes shell commands and returns stdout/stderr.
-
-Workflow:
-1. Plan what needs to be done.
-2. Use `bash` to read files, run commands, write code, etc.
-3. After gathering enough information or completing the task, give your final answer in natural language.
-4. To finish, reply with a regular message (no tool call).
-
-Be concise. Explain what you're doing before each command."""
-
-LLM_TOOLS = [
-    {"type": "function",
-     "function": {"name": "bash",
-                  "description": "Execute a shell command and return the output.",
-                  "parameters": {"type": "object",
-                                 "properties": {
-                                     "command": {"type": "string", "description": "The bash command to execute."}
-                                 },
-                                 "required": ["command"]}
-                 }
-            }]
-
 
 def run_bash(command: str) -> str:
     try:
@@ -46,9 +23,9 @@ def run_bash(command: str) -> str:
         return "Error: command timed out after 120s"
 
 
-def call_tool(name: str, arguments: dict) -> str:
-    func = {"bash": run_bash}.get(name)
-    if not func:
+def call_tool(name: str, arguments: dict, available: set[str]) -> str:
+    func = run_bash if name == "bash" else META_HANDLERS.get(name) or catalog_handler(name)
+    if not func or name not in available:
         return f"Error: unknown tool '{name}'"
     try:
         return func(**arguments)
@@ -56,8 +33,14 @@ def call_tool(name: str, arguments: dict) -> str:
         return f"Error calling {name}: {e}"
 
 
+def catalog_handler(name: str):
+    if name not in TOOLS.specs:
+        return None
+    return lambda **arguments: run_catalog_tool(name, arguments)
+
+
 llm = ChatOpenAI(model=LLM_MODEL, base_url=LLM_BASE_URL, api_key=LLM_API_KEY,
-                 max_tokens=4096, max_retries=0).bind_tools(LLM_TOOLS, tool_choice="auto")
+                 max_tokens=4096, max_retries=0)
 
 
 def to_openai_tool_call(tool_call_id: str, name: str, arguments: str) -> dict:
@@ -69,8 +52,8 @@ def to_usage(usage_metadata: dict) -> dict:
             "cached": usage_metadata.get("input_token_details", {}).get("cache_read", 0)}
 
 
-def call_llm(messages):
-    msg = llm.invoke(messages)
+def call_llm(messages, tools):
+    msg = llm.bind_tools(tools, tool_choice="auto").invoke(messages)
     content = msg.text.strip()
     tool_calls = [to_openai_tool_call(tc["id"], tc["name"], json.dumps(tc["args"])) for tc in msg.tool_calls]
     tool_calls += [to_openai_tool_call(tc["id"], tc["name"], tc["args"]) for tc in msg.invalid_tool_calls]
@@ -84,12 +67,14 @@ class AgentState(TypedDict):
     tool_calls: list[dict]
     usage: Annotated[list[dict], operator.add]
     stop_reason: str
+    tool_mode: str
+    tools: list[dict]
 
 
 def llm_node(state: AgentState) -> dict:
     turn = state["turn"] + 1
     print(f"\n{'='*60}\n🔄 Turn {turn}\n{'='*60}")
-    content, tool_calls, usage = call_llm(state["messages"])
+    content, tool_calls, usage = call_llm(state["messages"], state["tools"])
     if content:
         print(f"\n🤖 {content}")
     return {"turn": turn, "content": content, "tool_calls": tool_calls, "usage": [usage]}
@@ -99,16 +84,25 @@ def tools_node(state: AgentState) -> dict:
     content = state["content"]
     prefix = "\n" if content else ""
     new_messages = []
+    tools = state["tools"]
     for tool_call in state["tool_calls"]:
         function = tool_call["function"]["name"]
         arguments = json.loads(tool_call["function"]["arguments"])
         tool_call_id = tool_call["id"]
         print(f"{prefix}🔧 Tool: {function}({json.dumps(arguments, ensure_ascii=False)})")
-        result = call_tool(function, arguments)
+        result = call_tool(function, arguments, {tool["function"]["name"] for tool in tools})
+        if state["tool_mode"] == "native" and function == "describe":
+            tools = bind_described_tool(tools, arguments.get("name"))
         print(f"   → {result[:500]}{'...' if len(result)>500 else ''}")
         new_messages.append({"role": "assistant", "content": content or None, "tool_calls": [tool_call]})
         new_messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": result})
-    return {"messages": new_messages}
+    return {"messages": new_messages, "tools": tools}
+
+
+def bind_described_tool(tools: list[dict], name: str | None) -> list[dict]:
+    if name not in TOOLS.specs or any(tool["function"]["name"] == name for tool in tools):
+        return tools
+    return [*tools, spec_tool(TOOLS.specs[name])]
 
 
 def finish_node(state: AgentState) -> dict:
@@ -151,10 +145,12 @@ def summarize_usage(state: AgentState) -> dict:
             "cached_tokens": sum(u["cached"] for u in usage), "peak_context": max(u["input"] for u in usage)}
 
 
-def agent_loop(user_message: str) -> dict:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}]
+def agent_loop(user_message: str, tool_mode: str = "lazy") -> dict:
+    assert tool_mode in TOOL_MODES, tool_mode
+    messages = [{"role": "system", "content": system_prompt(tool_mode)}, {"role": "user", "content": user_message}]
     state = build_graph().invoke(
-        {"messages": messages, "turn": 0, "content": "", "tool_calls": [], "usage": [], "stop_reason": ""},
+        {"messages": messages, "turn": 0, "content": "", "tool_calls": [], "usage": [], "stop_reason": "",
+         "tool_mode": tool_mode, "tools": initial_tools(tool_mode)},
         {"recursion_limit": 2 * MAX_TURNS + 2},
     )
     metrics = summarize_usage(state)
@@ -167,4 +163,4 @@ if __name__ == "__main__":
     if not prompt.strip():
         print("No task provided. Exiting.")
         sys.exit(1)
-    agent_loop(prompt)
+    agent_loop(prompt, os.environ.get("TOOL_MODE", "lazy"))
