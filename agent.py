@@ -1,6 +1,9 @@
 """Minimal coding agent loop — one tool: bash."""
-import json, os, sys, subprocess
+import json, operator, os, sys, subprocess
+from typing import Annotated, Literal, TypedDict
+
 import requests
+from langgraph.graph import END, START, StateGraph
 
 
 LLM_BASE_URL = os.environ["LLM_BASE_URL"]
@@ -65,30 +68,77 @@ def call_llm(messages):
     return content, tool_calls
 
 
-def agent_loop(user_message: str) -> None:
-    messages: list[dict[str, object]] = [
-        {"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}
-    ]
-    for turn in range(1, MAX_TURNS + 1):
-        print(f"\n{'='*60}\n🔄 Turn {turn}\n{'='*60}")
-        content, tool_calls = call_llm(messages)
-        if content:
-            print(f"\n🤖 {content}")
-        if not tool_calls:
-            print("(no text output)" if not content else "")
-            print("✅ Agent finished")
-            return
-        prefix = "\n" if content else ""
-        for tool_call in tool_calls:
-            function = tool_call["function"]["name"]
-            arguments = json.loads(tool_call["function"]["arguments"])
-            tool_call_id = tool_call["id"]
-            print(f"{prefix}🔧 Tool: {function}({json.dumps(arguments, ensure_ascii=False)})")
-            result = call_tool(function, arguments)
-            print(f"   → {result[:500]}{'...' if len(result)>500 else ''}")
-            messages.append({"role": "assistant", "content": content or None, "tool_calls": [tool_call]})
-            messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": result})
+class AgentState(TypedDict):
+    messages: Annotated[list[dict], operator.add]
+    turn: int
+    content: str
+    tool_calls: list[dict]
+
+
+def llm_node(state: AgentState) -> dict:
+    turn = state["turn"] + 1
+    print(f"\n{'='*60}\n🔄 Turn {turn}\n{'='*60}")
+    content, tool_calls = call_llm(state["messages"])
+    if content:
+        print(f"\n🤖 {content}")
+    return {"turn": turn, "content": content, "tool_calls": tool_calls}
+
+
+def tools_node(state: AgentState) -> dict:
+    content = state["content"]
+    prefix = "\n" if content else ""
+    new_messages = []
+    for tool_call in state["tool_calls"]:
+        function = tool_call["function"]["name"]
+        arguments = json.loads(tool_call["function"]["arguments"])
+        tool_call_id = tool_call["id"]
+        print(f"{prefix}🔧 Tool: {function}({json.dumps(arguments, ensure_ascii=False)})")
+        result = call_tool(function, arguments)
+        print(f"   → {result[:500]}{'...' if len(result)>500 else ''}")
+        new_messages.append({"role": "assistant", "content": content or None, "tool_calls": [tool_call]})
+        new_messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": result})
+    return {"messages": new_messages}
+
+
+def finish_node(state: AgentState) -> dict:
+    print("(no text output)" if not state["content"] else "")
+    print("✅ Agent finished")
+    return {}
+
+
+def max_turns_node(state: AgentState) -> dict:
     print(f"\n⚠️  Max turns ({MAX_TURNS}) reached. Stopping.")
+    return {}
+
+
+def route_after_llm(state: AgentState) -> Literal["tools", "finish"]:
+    return "tools" if state["tool_calls"] else "finish"
+
+
+def route_after_tools(state: AgentState) -> Literal["llm", "max_turns"]:
+    return "max_turns" if state["turn"] >= MAX_TURNS else "llm"
+
+
+def build_graph():
+    graph = StateGraph(AgentState)
+    graph.add_node("llm", llm_node)
+    graph.add_node("tools", tools_node)
+    graph.add_node("finish", finish_node)
+    graph.add_node("max_turns", max_turns_node)
+    graph.add_edge(START, "llm")
+    graph.add_conditional_edges("llm", route_after_llm)
+    graph.add_conditional_edges("tools", route_after_tools)
+    graph.add_edge("finish", END)
+    graph.add_edge("max_turns", END)
+    return graph.compile()
+
+
+def agent_loop(user_message: str) -> None:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}]
+    build_graph().invoke(
+        {"messages": messages, "turn": 0, "content": "", "tool_calls": []},
+        {"recursion_limit": 2 * MAX_TURNS + 2},
+    )
 
 
 if __name__ == "__main__":
