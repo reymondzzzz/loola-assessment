@@ -111,3 +111,33 @@ reasons, not the full trajectory. Newest entries at the bottom.
     to many small steps (51 turns). In lazy the model ignored the catalog and used bash + skills; loaded
     skill bodies raised its peak context. n=1 cannot separate these effects from noise.
   - No quality regression: every mode closed all 11 tickets including the recall ticket.
+
+## 10. Part 2 — harness graph and execution reliability
+- `harness/graph.py`: StateGraph with the spec's flow: context_manager → prompt_builder → llm → router →
+  (tool_router → tool_executor → output_processor → state_update → context_manager) | final_verification.
+  Business logic lives in plain modules (`executor`, `llm`, `store`, `metrics`); nodes only orchestrate.
+  `InMemorySaver` checkpointer for graph state (this is persistence, unrelated to the provider KV cache).
+- `AgentState` separates the active LLM context (`active_messages`, `summary`) from structured state
+  (`observations`, `active_skills`, `active_tools`, `completed_actions`, `executor`), and the immutable
+  history goes to an append-only JSONL `EventStore` outside the prompt.
+- Protocol fix (baseline bug): one assistant message per turn holding all tool calls, followed by one tool
+  result per `tool_call_id`. `final_verification` checks protocol integrity.
+- Error taxonomy (`harness/executor.py`), returned as structured JSON
+  `{ok, code, message, retry_same_call, model_can_repair}`:
+  - model-repairable: INVALID_JSON (malformed arguments no longer crash the loop), INVALID_ARGUMENTS
+    (schema), UNKNOWN_TOOL, FILE_NOT_FOUND, NOT_AVAILABLE, TOOL_ERROR, non-zero exit codes (plain output).
+  - harness-recoverable: LLM connection/timeout/429/5xx → bounded retries, exponential backoff + jitter,
+    overall deadline (`harness/llm.py`); transient errors of read-only idempotent tools → 2 retries.
+  - non-recoverable: auth errors stop the run; PERMISSION_DENIED (synthetic side-effect tools, a small bash
+    denylist: sudo, git push, rm -rf /, …) tells the model not to retry; budgets (turns, tool calls,
+    tokens, wall time) stop the run with an explicit status; context overflow gets its own status.
+- Never retried: bash and non-idempotent tools. A bash timeout kills the whole process group and reports
+  that the command may have partially run, asking the model to inspect state first.
+- Loop detection: same tool + normalized arguments failing `loop_limit` (3) times without any environment
+  change in between → LOOP_DETECTED instead of executing. Any successful write/bash bumps the environment
+  version, so a retry after a fix is allowed.
+- Bash output is streamed to temp files instead of pipes, so huge outputs do not accumulate in memory.
+- Tool calls run sequentially in model order: shell commands may depend on each other.
+- Tests (mock LLM replaying scripted replies): protocol integrity, error recovery, permission, loop
+  detection and reset, non-idempotent retry protection, bash timeout side effects, LLM retry/give-up,
+  budget exhaustion.

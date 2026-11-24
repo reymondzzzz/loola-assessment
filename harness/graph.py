@@ -1,0 +1,203 @@
+import json, time
+from dataclasses import dataclass, field
+from typing import Literal, TypedDict
+
+import openai
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+
+from harness.config import HarnessConfig
+from harness.protocol import protocol_errors
+from harness.executor import ToolExecutor, ToolOutcome
+from harness.llm import ContextOverflow, LLMClient
+from harness.metrics import MetricsCollector
+from harness.prompt import initial_tools, system_prompt
+from harness.registry import SKILLS, TOOLS, spec_tool
+from harness.store import EventStore, new_run_dir
+
+DISCOVERY_TOOLS = {"discover", "describe", "load_skill", "read_skill_resource"}
+
+
+class AgentState(TypedDict):
+    task: str
+    constraints: list[str]
+    active_messages: list[dict]
+    summary: dict
+    observations: dict
+    active_skills: dict
+    active_tools: list[dict]
+    completed_actions: list[dict]
+    pending_actions: list[dict]
+    context_epoch: int
+    status: str
+    turn: int
+    request: list[dict]
+    response: dict
+    executor: dict
+
+
+@dataclass
+class Run:
+    config: HarnessConfig
+    events: EventStore
+    metrics: MetricsCollector = field(default_factory=MetricsCollector)
+    llm: LLMClient | None = None
+    started: float = field(default_factory=time.monotonic)
+
+
+def mode_name(config: HarnessConfig) -> str:
+    if not config.lazy_tools:
+        return "eager"
+    return "native" if config.native_binding else "lazy"
+
+
+def parsed_arguments(raw: str) -> dict:
+    try:
+        arguments = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return arguments if isinstance(arguments, dict) else {}
+
+
+def build_request(state: AgentState, config: HarnessConfig) -> list[dict]:
+    return [{"role": "system", "content": system_prompt(mode_name(config))},
+            {"role": "user", "content": state["task"]}, *state["active_messages"]]
+
+
+def budget_status(state: AgentState, run: Run) -> str | None:
+    counters, config = run.metrics.counters, run.config
+    if state["turn"] >= config.max_turns:
+        return "max_turns"
+    if counters["tool_calls"] >= config.max_tool_calls:
+        return "max_tool_calls"
+    if counters["input_tokens"] + counters["output_tokens"] >= config.max_total_tokens:
+        return "max_tokens"
+    if time.monotonic() - run.started >= config.max_seconds:
+        return "max_seconds"
+    return None
+
+
+def build_graph(run: Run):
+    def context_manager(state: AgentState) -> dict:
+        return {}
+
+    def prompt_builder(state: AgentState) -> dict:
+        return {"request": build_request(state, run.config)}
+
+    def llm(state: AgentState) -> dict:
+        turn = state["turn"] + 1
+        try:
+            content, tool_calls, usage = run.llm.complete(state["request"], state["active_tools"])
+        except ContextOverflow as error:
+            run.events.append("context_overflow", turn=turn, error=str(error)[:500])
+            return {"turn": turn, "status": "context_overflow"}
+        except (openai.AuthenticationError, openai.PermissionDeniedError) as error:
+            run.events.append("fatal_llm_error", turn=turn, error=str(error)[:500])
+            return {"turn": turn, "status": "llm_unauthorized"}
+        except openai.APIError as error:
+            run.events.append("fatal_llm_error", turn=turn, error=str(error)[:500])
+            return {"turn": turn, "status": "llm_unavailable"}
+        run.events.append("assistant", turn=turn, content=content, tool_calls=tool_calls, usage=usage)
+        print(f"\n{'=' * 60}\n🔄 Turn {turn}\n{'=' * 60}" + (f"\n\n🤖 {content}" if content else ""))
+        return {"turn": turn, "response": {"content": content, "tool_calls": tool_calls}}
+
+    def route_after_llm(state: AgentState) -> Literal["tool_router", "final_verification", "__end__"]:
+        if state["status"] != "running":
+            return END
+        return "tool_router" if state["response"]["tool_calls"] else "final_verification"
+
+    def tool_router(state: AgentState) -> dict:
+        pending = [{"id": call["id"], "name": call["function"]["name"], "arguments": call["function"]["arguments"]}
+                   for call in state["response"]["tool_calls"]]
+        return {"pending_actions": pending}
+
+    def tool_executor(state: AgentState) -> dict:
+        executor = ToolExecutor(available={tool["function"]["name"] for tool in state["active_tools"]},
+                                loop_limit=run.config.loop_limit, **state["executor"])
+        results = []
+        for action in state["pending_actions"]:
+            outcome = executor.execute(action["name"], action["arguments"])
+            run.metrics.count("tool_calls")
+            run.metrics.count(f"tool_code_{outcome.code}")
+            if action["name"] in DISCOVERY_TOOLS:
+                run.metrics.count("discovery_calls")
+            print(f"🔧 Tool: {action['name']}({action['arguments'][:300]})\n   → {outcome.content[:500]}"
+                  f"{'...' if len(outcome.content) > 500 else ''}")
+            results.append({**action, **vars(outcome)})
+        executed_state = {"environment_version": executor.environment_version, "failures": executor.failures}
+        return {"pending_actions": results, "executor": executed_state}
+
+    def output_processor(state: AgentState) -> dict:
+        return {"pending_actions": [{**action, "visible": action["content"]} for action in state["pending_actions"]]}
+
+    def state_update(state: AgentState) -> dict:
+        response, actions = state["response"], state["pending_actions"]
+        messages = [*state["active_messages"],
+                    {"role": "assistant", "content": response["content"] or None, "tool_calls": response["tool_calls"]}]
+        tools, skills, completed = list(state["active_tools"]), dict(state["active_skills"]), list(state["completed_actions"])
+        for action in actions:
+            messages.append({"role": "tool", "tool_call_id": action["id"], "content": action["visible"]})
+            run.events.append("tool_result", turn=state["turn"], tool_call_id=action["id"], name=action["name"],
+                              arguments=action["arguments"], code=action["code"], content=action["content"])
+            completed.append({"turn": state["turn"], "tool": action["name"], "code": action["code"]})
+            arguments = parsed_arguments(action["arguments"])
+            if action["name"] == "load_skill" and action["ok"] and arguments.get("name") in SKILLS.skills:
+                skill = SKILLS.skills[arguments["name"]]
+                skills[skill.name] = {"skill_id": skill.name, "version": skill.version, "loaded_at_turn": state["turn"],
+                                      "visible_in_context": True, "message_tool_call_id": action["id"]}
+            if run.config.native_binding and action["name"] == "describe" and action["ok"]:
+                name = arguments.get("name")
+                if name in TOOLS.specs and all(tool["function"]["name"] != name for tool in tools):
+                    tools.append(spec_tool(TOOLS.specs[name]))
+        update = {"active_messages": messages, "active_tools": tools, "active_skills": skills,
+                  "completed_actions": completed, "pending_actions": []}
+        if (status := budget_status(state, run)) is not None:
+            run.events.append("budget_exhausted", turn=state["turn"], status=status)
+            update["status"] = status
+        return update
+
+    def route_after_update(state: AgentState) -> Literal["context_manager", "__end__"]:
+        return "context_manager" if state["status"] == "running" else END
+
+    def final_verification(state: AgentState) -> dict:
+        messages = [*state["active_messages"], {"role": "assistant", "content": state["response"]["content"]}]
+        errors = protocol_errors(messages)
+        run.events.append("final", turn=state["turn"], protocol_errors=errors)
+        print("✅ Agent finished" if not errors else f"❌ Protocol errors: {errors}")
+        return {"active_messages": messages, "status": "finished" if not errors else "protocol_error"}
+
+    graph = StateGraph(AgentState)
+    for name, node in [("context_manager", context_manager), ("prompt_builder", prompt_builder), ("llm", llm),
+                       ("tool_router", tool_router), ("tool_executor", tool_executor),
+                       ("output_processor", output_processor), ("state_update", state_update),
+                       ("final_verification", final_verification)]:
+        graph.add_node(name, node)
+    graph.add_edge(START, "context_manager")
+    graph.add_edge("context_manager", "prompt_builder")
+    graph.add_edge("prompt_builder", "llm")
+    graph.add_conditional_edges("llm", route_after_llm)
+    graph.add_edge("tool_router", "tool_executor")
+    graph.add_edge("tool_executor", "output_processor")
+    graph.add_edge("output_processor", "state_update")
+    graph.add_conditional_edges("state_update", route_after_update)
+    graph.add_edge("final_verification", END)
+    return graph.compile(checkpointer=InMemorySaver())
+
+
+def initial_state(task: str, config: HarnessConfig) -> AgentState:
+    return AgentState(task=task, constraints=[], active_messages=[], summary={}, observations={}, active_skills={},
+                      active_tools=initial_tools(mode_name(config)), completed_actions=[], pending_actions=[],
+                      context_epoch=0, status="running", turn=0, request=[], response={},
+                      executor={"environment_version": 0, "failures": {}})
+
+
+def run_agent(task: str, config: HarnessConfig, llm: LLMClient | None = None) -> dict:
+    run = Run(config=config, events=EventStore(new_run_dir()))
+    run.llm = llm or LLMClient(run.metrics, config.llm_retries, config.llm_deadline_seconds)
+    run.events.append("task", task=task)
+    state = build_graph(run).invoke(initial_state(task, config),
+                                    {"recursion_limit": 8 * config.max_turns + 20, "configurable": {"thread_id": "run"}})
+    metrics = {"stop_reason": state["status"], "turns": state["turn"], **run.metrics.snapshot(),
+               "events_path": str(run.events.path)}
+    print(f"\n📊 {json.dumps(metrics)}")
+    return metrics

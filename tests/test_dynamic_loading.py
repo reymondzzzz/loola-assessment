@@ -1,8 +1,9 @@
 import json
 import sqlite3
 
-import agent
 from harness import registry
+from harness.config import mode_config
+from harness.executor import ToolExecutor
 from harness.prompt import initial_tools, system_prompt
 
 
@@ -40,7 +41,7 @@ def test_catalog_tools_work(tmp_path, monkeypatch):
         db.execute("INSERT INTO t VALUES (7)")
     assert registry.invoke("sqlite_query", {"database": "x.db", "sql": "SELECT v FROM t"}) == "v\n7"
     delete = {"name": "sqlite_query", "arguments": {"database": "x.db", "sql": "DELETE FROM t"}}
-    assert "readonly" in agent.call_tool("invoke", delete, {"invoke"})
+    assert "readonly" in ToolExecutor(available={"invoke"}).execute("invoke", json.dumps(delete)).content
 
 
 def test_skill_progressive_loading():
@@ -64,12 +65,17 @@ def test_modes_share_one_catalog():
 
 
 def test_native_binding():
-    tools = initial_tools("native")
-    assert "unknown tool 'git_log'" in agent.call_tool("git_log", {}, set(names(tools)))
-    bound = agent.bind_described_tool(tools, "git_log")
-    assert names(bound)[-1] == "git_log"
-    assert agent.bind_described_tool(bound, "git_log") is bound
-    assert agent.bind_described_tool(bound, "nope") is bound
+    from tests.fakes import call, run_script
+    script = [("", [call("git_log", {"max_count": 1}, "c1")]),
+              ("", [call("describe", {"name": "git_log"}, "c2")]),
+              ("", [call("git_log", {"max_count": 1}, "c3")])]
+    _, llm = run_script(script, mode_config("native"))
+    assert "git_log" not in names(llm.requests[1]["tools"])
+    assert names(llm.requests[2]["tools"])[-1] == "git_log"
+    results = [m for m in llm.requests[3]["messages"] if m["role"] == "tool"]
+    assert '"UNKNOWN_TOOL"' in results[0]["content"] and "UNKNOWN_TOOL" not in results[2]["content"]
+    _, lazy = run_script(script, mode_config("lazy"))
+    assert all(names(r["tools"]) == names(initial_tools("lazy")) for r in lazy.requests)
 
 
 def test_lazy_prefix_unchanged_by_discovery():
