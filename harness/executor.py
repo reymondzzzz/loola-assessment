@@ -118,10 +118,10 @@ def run_catalog_tool(spec: ToolSpec, arguments: dict) -> ToolOutcome:
 
 
 def repeat_is_safe(name: str, arguments: dict) -> bool:
-    if name in META_HANDLERS or name in ("read_artifact", "search_history"):
-        return True
     if name == "invoke":
         name = arguments.get("name") if isinstance(arguments.get("name"), str) else ""
+    elif name in META_HANDLERS or name in ("read_artifact", "search_history"):
+        return True
     spec = TOOLS.specs.get(name)
     return spec is not None and spec.read_only and spec.idempotent
 

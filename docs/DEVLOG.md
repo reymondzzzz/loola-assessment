@@ -347,3 +347,7 @@ All five findings were confirmed against the code before fixing; each fix has a 
   2. SIGKILL while waiting for the LLM after a tool finished → resume does not re-run the tool, metrics
      carry over (`tool_calls == 1`), run finishes.
   3. Unknown run id → clean error.
+- Security review of the resume commit: `repeat_is_safe` returned True for every `invoke` because `invoke`
+  is in `META_HANDLERS`, so an interrupted `invoke(edit_file)` would have been repeated on resume. `invoke`
+  is now judged by its target tool's spec (read-only and idempotent only); test covers invoke of
+  read_file/edit_file/write_file/malformed, bash, meta and direct catalog tools.

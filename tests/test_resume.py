@@ -96,3 +96,14 @@ def test_resume_unknown_run_fails_cleanly(cli):
     process = start(FakeOpenAI([]), "--resume", "20990101-000000-abcdef")
     output, _ = process.communicate(timeout=30)
     assert process.returncode != 0 and "no run" in output
+
+
+def test_only_read_only_idempotent_calls_are_repeated_after_a_crash():
+    from harness.executor import repeat_is_safe
+    assert repeat_is_safe("invoke", {"name": "read_file", "arguments": {"path": "a"}})
+    assert not repeat_is_safe("invoke", {"name": "edit_file", "arguments": {}})
+    assert not repeat_is_safe("invoke", {"name": "write_file", "arguments": {}})
+    assert not repeat_is_safe("invoke", {"name": 5})
+    assert not repeat_is_safe("bash", {"command": "ls"})
+    assert repeat_is_safe("describe", {"name": "git_log"}) and repeat_is_safe("search_history", {"query": "x"})
+    assert not repeat_is_safe("edit_file", {}) and repeat_is_safe("git_log", {})
