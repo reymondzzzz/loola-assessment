@@ -31,9 +31,16 @@ def integer(description: str) -> dict:
     return {"type": "integer", "description": description}
 
 
-def run(command: list[str]) -> str:
+class CommandResult(str):
+    exit_code: int
+
+
+def run(command: list[str]) -> CommandResult:
     result = subprocess.run(command, capture_output=True, text=True, timeout=120)
-    return f"Exit code: {result.returncode}\n{result.stdout}" + (f"\nSTDERR:\n{result.stderr}" if result.stderr else "")
+    output = CommandResult(f"Exit code: {result.returncode}\n{result.stdout}"
+                           + (f"\nSTDERR:\n{result.stderr}" if result.stderr else ""))
+    output.exit_code = result.returncode
+    return output
 
 
 def read_file(path: str, offset: int = 1, limit: int = 200) -> str:

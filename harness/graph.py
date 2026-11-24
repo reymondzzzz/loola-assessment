@@ -1,4 +1,5 @@
 import json, time
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict
 
@@ -12,7 +13,7 @@ from langgraph.graph import END, START, StateGraph
 from harness.config import HarnessConfig
 from harness.context import Candidate, ContextManager, build_prompt
 from harness.protocol import protocol_errors
-from harness.executor import ToolExecutor, ToolOutcome, failure, outcome_unknown, repeat_is_safe
+from harness.executor import ToolExecutor, failure, outcome_unknown, repeat_is_safe, run_bash
 from harness.llm import ContextOverflow, LLMClient
 from harness.memory import MEMORY_TOOL_SCHEMAS, read_artifact, search_history
 from harness.metrics import MetricsCollector
@@ -24,6 +25,7 @@ from harness.tokens import count_messages
 
 DISCOVERY_TOOLS = {"discover", "describe", "load_skill", "read_skill_resource"}
 RECOVERY_TOOLS = {"read_artifact", "search_history"}
+VERIFY_TAIL_CHARS = 1500
 
 
 class AgentState(TypedDict):
@@ -47,6 +49,7 @@ class AgentState(TypedDict):
     metrics: dict
     requirements: list[dict]
     call_signatures: list[str]
+    verification_failures: int
 
 
 @dataclass
@@ -106,6 +109,12 @@ def mark_stale(observations: dict, turn: int, environment_changed: bool) -> dict
         if observation["kind"] == "test" and environment_changed:
             observation["stale"] = True
     return observations
+
+
+def verification_exit_code(outcome) -> int:
+    if not outcome.ok:
+        return -1
+    return int(outcome.content.split("\n", 1)[0].removeprefix("Exit code: "))
 
 
 def call_signature(action: dict) -> str:
@@ -231,7 +240,7 @@ def build_graph(run: Run, checkpointer):
                 run.metrics.count("repeated_tool_calls")
             signatures.append(signature)
             run.events.append("tool_started", tool_call_id=action["id"], name=action["name"], arguments=action["arguments"])
-            outcome = executor.execute(action["name"], action["arguments"])
+            outcome = executor.execute(action["name"], action["arguments"], action["id"])
             run.events.append("tool_finished", tool_call_id=action["id"], outcome=vars(outcome))
             run.metrics.count("tool_calls")
             run.metrics.count(f"tool_code_{outcome.code}")
@@ -293,8 +302,36 @@ def build_graph(run: Run, checkpointer):
         messages = [*state["active_messages"], {"role": "assistant", "content": state["response"]["content"]}]
         errors = protocol_errors(messages)
         run.events.append("final", turn=state["turn"], protocol_errors=errors)
-        print("✅ Agent finished" if not errors else f"❌ Protocol errors: {errors}")
-        return {"active_messages": messages, "status": "finished" if not errors else "protocol_error"}
+        if errors:
+            print(f"❌ Protocol errors: {errors}")
+            return {"active_messages": messages, "status": "protocol_error"}
+        command = run.config.verify_command
+        if not command:
+            print("✅ Agent finished")
+            return {"active_messages": messages, "status": "finished"}
+        outcome = run_bash(command, timeout=run.config.verify_timeout)
+        exit_code = verification_exit_code(outcome)
+        run.metrics.count("verification_runs")
+        run.events.append("verification", turn=state["turn"], command=command, exit_code=exit_code,
+                          output=outcome.content, artifact_id=run.artifacts.save(outcome.content)
+                          if run.config.artifact_offloading else None)
+        if outcome.spill_path:
+            Path(outcome.spill_path).unlink(missing_ok=True)
+        if exit_code == 0:
+            print(f"✅ Verified: `{command}` passed")
+            return {"active_messages": messages, "status": "verified"}
+        failures = state["verification_failures"] + 1
+        run.metrics.count("verification_failures")
+        if failures >= run.config.verify_attempts or budget_status(state, run) is not None:
+            print(f"❌ Verification failed: `{command}` (exit {exit_code})")
+            return {"active_messages": messages, "status": "verification_failed", "verification_failures": failures}
+        print(f"🔁 Verification failed: `{command}` (exit {exit_code}); returning to the agent")
+        diagnostic = {"role": "user", "content": f"[Automatic verification failed: `{command}` exited with {exit_code}. "
+                      f"The task is not done yet; fix the problem, then finish again.]\n{outcome.content[-VERIFY_TAIL_CHARS:]}"}
+        return {"active_messages": [*messages, diagnostic], "status": "running", "verification_failures": failures}
+
+    def route_after_verification(state: AgentState) -> Literal["context_manager", "__end__"]:
+        return "context_manager" if state["status"] == "running" else END
 
     def with_metrics(node):
         return lambda state: {**node(state), "metrics": run.metrics.export()}
@@ -314,7 +351,7 @@ def build_graph(run: Run, checkpointer):
     graph.add_edge("tool_executor", "output_processor")
     graph.add_edge("output_processor", "state_update")
     graph.add_conditional_edges("state_update", route_after_update)
-    graph.add_edge("final_verification", END)
+    graph.add_conditional_edges("final_verification", route_after_verification)
     return graph.compile(checkpointer=checkpointer)
 
 
@@ -322,7 +359,7 @@ def initial_state(task: str, config: HarnessConfig) -> AgentState:
     return AgentState(task=task, active_messages=[], summary={}, observations={}, active_skills={},
                       active_tools=initial_tools(config), completed_actions=[], pending_actions=[],
                       context_epoch=0, status="running", turn=0, request=[], request_tokens=0, calibration=1.0,
-                      overflow_attempts=0, response={}, metrics={}, requirements=[], call_signatures=[],
+                      overflow_attempts=0, response={}, metrics={}, requirements=[], call_signatures=[], verification_failures=0,
                       executor={"environment_version": 0, "failures": {}})
 
 

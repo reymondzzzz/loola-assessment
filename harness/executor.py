@@ -8,6 +8,9 @@ from harness.registry import BASH_TOOL, META_HANDLERS, META_TOOL_SCHEMAS, TOOLS,
 
 BASH_TIMEOUT = 120
 CAPTURE_HEAD_BYTES = CAPTURE_TAIL_BYTES = 128_000
+FINGERPRINT_SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache"}
+FINGERPRINT_MAX_FILES = 20_000
+REPEAT_HINT_AFTER = 2
 TRANSIENT_ERRORS = (sqlite3.OperationalError, ConnectionError, TimeoutError, BlockingIOError)
 TRANSIENT_RETRIES = 2
 FORBIDDEN_COMMANDS = re.compile(r"(^|[;&|]\s*)(sudo|shutdown|reboot|mkfs|git\s+push)\b|rm\s+-rf\s+(/|~)(\s|$)|:\(\)\s*\{")
@@ -53,10 +56,27 @@ def spill_full_output(exit_code: int, stdout, stderr) -> str:
     return full.name
 
 
+def workspace_fingerprint() -> str | None:
+    digest, files = hashlib.sha256(), 0
+    for root, dirs, names in os.walk("."):
+        dirs[:] = sorted(d for d in dirs if d not in FINGERPRINT_SKIP_DIRS)
+        for name in sorted(names):
+            files += 1
+            if files > FINGERPRINT_MAX_FILES:
+                return None
+            try:
+                status = os.stat(os.path.join(root, name))
+            except OSError:
+                continue
+            digest.update(f"{root}/{name}:{status.st_mtime_ns}:{status.st_size}\n".encode())
+    return digest.hexdigest()
+
+
 def run_bash(command: str, timeout: float = BASH_TIMEOUT) -> ToolOutcome:
     if FORBIDDEN_COMMANDS.search(command):
         return failure("PERMISSION_DENIED", "This command is not permitted in this session. Do not retry it; "
                        "find another way or report that it is needed.", model_can_repair=False)
+    before = workspace_fingerprint()
     with tempfile.TemporaryFile("w+b") as stdout, tempfile.TemporaryFile("w+b") as stderr:
         process = subprocess.Popen(command, shell=True, stdout=stdout, stderr=stderr, start_new_session=True)
         try:
@@ -71,7 +91,8 @@ def run_bash(command: str, timeout: float = BASH_TIMEOUT) -> ToolOutcome:
         (out, out_cut), (err, err_cut) = read_bounded(stdout), read_bounded(stderr)
         spill_path = spill_full_output(exit_code, stdout, stderr) if out_cut or err_cut else None
     content = f"Exit code: {exit_code}\n{out}" + (f"\nSTDERR:\n{err}" if err else "")
-    return ToolOutcome(True, content, "OK" if exit_code == 0 else "NONZERO_EXIT", changed_environment=True,
+    changed = before is None or workspace_fingerprint() != before
+    return ToolOutcome(True, content, "OK" if exit_code == 0 else "NONZERO_EXIT", changed_environment=changed,
                        spill_path=spill_path)
 
 
@@ -97,7 +118,9 @@ def run_catalog_tool(spec: ToolSpec, arguments: dict) -> ToolOutcome:
     attempts = TRANSIENT_RETRIES + 1 if spec.read_only and spec.idempotent else 1
     for attempt in range(attempts):
         try:
-            return ToolOutcome(True, call_with_timeout(spec, arguments), changed_environment=not spec.read_only)
+            result = call_with_timeout(spec, arguments)
+            code = "NONZERO_EXIT" if getattr(result, "exit_code", 0) else "OK"
+            return ToolOutcome(True, str(result), code, changed_environment=not spec.read_only)
         except FileNotFoundError as error:
             return failure("FILE_NOT_FOUND", f"{error}. Check the path with list_dir or bash `ls`.")
         except FutureTimeout:
@@ -134,19 +157,33 @@ def outcome_unknown() -> ToolOutcome:
     return outcome
 
 
+def failure_summary(outcome: ToolOutcome) -> str:
+    if not outcome.ok:
+        return json.loads(outcome.content)["message"][:160]
+    lines = [line for line in outcome.content.splitlines() if line.strip()]
+    return " | ".join(lines[:1] + lines[-1:])[:160]
+
+
+def add_hint(outcome: ToolOutcome, hint: str) -> None:
+    if outcome.ok:
+        outcome.content += f"\n[Hint: {hint}]"
+    else:
+        outcome.content = json.dumps({**json.loads(outcome.content), "hint": hint})
+
+
 @dataclass
 class ToolExecutor:
     available: set[str]
     loop_limit: int = 3
     environment_version: int = 0
-    failures: dict[str, int] = field(default_factory=dict)
+    failures: dict[str, dict] = field(default_factory=dict)
     extra_tools: dict[str, tuple[dict, Callable[..., str]]] = field(default_factory=dict)
 
     def call_key(self, name: str, arguments: dict) -> str:
         normalized = json.dumps(arguments, sort_keys=True)
         return hashlib.sha256(f"{name}|{normalized}|{self.environment_version}".encode()).hexdigest()
 
-    def execute(self, name: str, raw_arguments: str) -> ToolOutcome:
+    def execute(self, name: str, raw_arguments: str, call_id: str = "") -> ToolOutcome:
         try:
             arguments = json.loads(raw_arguments or "{}")
         except json.JSONDecodeError as error:
@@ -157,15 +194,21 @@ class ToolExecutor:
         if name not in self.available:
             return failure("UNKNOWN_TOOL", f"Tool '{name}' is not available. Available: {', '.join(sorted(self.available))}.")
         key = self.call_key(name, arguments)
-        repeats = self.failures.get(key, 0)
-        if repeats >= self.loop_limit:
+        previous = self.failures.get(key)
+        repeats = previous["count"] if previous else 0
+        if repeats >= self.loop_limit and name != "bash":
             return failure("LOOP_DETECTED", f"This exact call already failed {repeats} times with no change in between. "
                            "Do not repeat it; try a different approach.")
         outcome = self.dispatch(name, arguments)
         if outcome.changed_environment:
             self.environment_version += 1
-        if not (outcome.ok and outcome.code == "OK"):
-            self.failures[key] = repeats + 1
+        if outcome.ok and outcome.code == "OK":
+            return outcome
+        self.failures[key] = {"count": repeats + 1, "call_id": call_id, "error": failure_summary(outcome)}
+        if previous and repeats + 1 >= REPEAT_HINT_AFTER and not outcome.changed_environment:
+            add_hint(outcome, f"This exact call has now failed {repeats + 1} times with no observable file change in "
+                              f"between (previous attempt: tool call {previous['call_id'] or '?'}, error: "
+                              f"{previous['error']}). Change something or try a different approach before repeating it.")
         return outcome
 
     def dispatch(self, name: str, arguments: dict) -> ToolOutcome:
