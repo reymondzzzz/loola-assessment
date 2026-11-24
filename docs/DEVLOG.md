@@ -370,3 +370,21 @@ All five findings were confirmed against the code before fixing; each fix has a 
   a requirement in a new process under a 12k window (hybrid); every later request carries task + requirement
   as user messages; ≥ 1 compaction happens; the independent check of `out.txt` sees the changed result.
   Metric: key order does not matter (repeat counted), a changed argument is not a repeat.
+
+## 23. 5/5: literal baseline in the benchmark (§16)
+- Correction: earlier docs called `baseline/original_agent.py` byte-identical to the provided code. It was
+  not: the first commit already replaced the placeholders (`"http://ip:port/v1"`, `"..."`) with
+  `os.environ[...]` (4 lines). The file is now restored to the provided text verbatim (SHA-256
+  `d1e005f6…eb1c`, pinned in `tests/test_original_baseline.py`, which also checks that the first commit differed
+  only in those 4 lines).
+- `bench/run.py --mode original` runs that file unmodified, in-process: endpoint, model and auth header are
+  injected as module attributes (`LLM_BASE_URL`, `LLM_MODEL`, `LLM_HEADERS`, read at call time), `MAX_TURNS`
+  is set to the same benchmark limit as every mode, and `requests.post` is wrapped to record usage from the
+  responses and to add a 600 s timeout (the provided call has none, so a hung request would stall the
+  benchmark). Payload, prompts, tool and loop are the provided ones, including `temperature=0.1` and
+  `max_tokens=4096`.
+- `--mode original-port` runs the LangGraph port; all earlier `original` rows (gpt-6-luna, which rejects
+  the provided payload) are relabelled `original-port`.
+- Results now carry `code_revision` (`git rev-parse --short HEAD`, `-dirty` if uncommitted).
+- Route test against the fake server: `run_once(…, "original")` generates the fixture, runs the provided loop,
+  scores independently; the server receives the provided payload; the file hash is unchanged afterwards.
