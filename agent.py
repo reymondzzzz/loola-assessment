@@ -2,14 +2,13 @@
 import json, operator, os, sys, subprocess
 from typing import Annotated, Literal, TypedDict
 
-import requests
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
 
 LLM_BASE_URL = os.environ["LLM_BASE_URL"]
 LLM_API_KEY = os.environ["LLM_API_KEY"]
 LLM_MODEL = os.environ["LLM_MODEL"]
-LLM_HEADERS = {"Content-Type": "application/json", "Authorization": f"Bearer {LLM_API_KEY}"}
 MAX_TURNS = 1000
 
 SYSTEM_PROMPT = """\
@@ -57,14 +56,19 @@ def call_tool(name: str, arguments: dict) -> str:
         return f"Error calling {name}: {e}"
 
 
+llm = ChatOpenAI(model=LLM_MODEL, base_url=LLM_BASE_URL, api_key=LLM_API_KEY,
+                 max_tokens=4096, max_retries=0).bind_tools(LLM_TOOLS, tool_choice="auto")
+
+
+def to_openai_tool_call(tool_call_id: str, name: str, arguments: str) -> dict:
+    return {"id": tool_call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+
 def call_llm(messages):
-    payload = {"model": LLM_MODEL, "messages": messages, "tools": LLM_TOOLS, "tool_choice": "auto",
-               "temperature": 0.1, "max_tokens": 4096}
-    llm_http_response = requests.post(f"{LLM_BASE_URL}/chat/completions", json=payload, headers=LLM_HEADERS)
-    llm_http_response.raise_for_status()
-    msg = llm_http_response.json()["choices"][0]["message"]
-    content = (msg.get("content") or "").strip()
-    tool_calls = msg.get("tool_calls") or []
+    msg = llm.invoke(messages)
+    content = msg.text.strip()
+    tool_calls = [to_openai_tool_call(tc["id"], tc["name"], json.dumps(tc["args"])) for tc in msg.tool_calls]
+    tool_calls += [to_openai_tool_call(tc["id"], tc["name"], tc["args"]) for tc in msg.invalid_tool_calls]
     return content, tool_calls
 
 
