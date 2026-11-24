@@ -290,3 +290,16 @@ All five findings were confirmed against the code before fixing; each fix has a 
   ~800 KB output). Limitation: history search indexes the preview of spilled outputs, so text that appears
   only in the unloaded middle is not searchable; it is reachable via `read_artifact`.
 - README test count updated (55).
+
+## 19. Closing five gaps with the spec — 1/5: configurable eviction policies (§9)
+- `HarnessConfig.eviction_policy` ∈ `default | fifo | size` (validated; `bench/run.py --eviction-policy`).
+  `default` is the previous combined ordering, unchanged (stale first, then size, then age; with
+  `cache_aware` the size bucket + later position tie-break). `fifo`: oldest observation first. `size`:
+  largest first.
+- Policy and mechanism stay separate: the policy only orders candidates; masking is the same mechanism.
+  The common guards are applied before any policy, so they hold in every mode: not masked, not pinned,
+  recoverable (artifact available), outside the protected recent interactions, ≥ 64 tokens.
+- Gap closed on the way: stale/duplicate eviction did not check `recoverable`.
+- Tests (`tests/test_eviction_policies.py`): the same history gives three different candidate orders; the
+  guards exclude pinned/unrecoverable/small/recent observations under every policy; the policy drives the
+  existing masking mechanism (fifo masks the oldest, size the largest); unknown policy names are rejected.

@@ -102,13 +102,19 @@ def eviction_candidates(candidate: Candidate, config: HarnessConfig) -> list[tup
                 and candidate.observations[call_id]["recoverable"]
                 and candidate.observations[call_id]["token_count"] >= MIN_MASKABLE_TOKENS]
 
-    def priority(item: tuple[str, int]):
-        observation = candidate.observations[item[0]]
+    observations = candidate.observations
+    if config.eviction_policy == "fifo":
+        return sorted(eligible, key=lambda item: (observations[item[0]]["created_at_turn"], item[1]))
+    if config.eviction_policy == "size":
+        return sorted(eligible, key=lambda item: (-observations[item[0]]["token_count"], item[1]))
+
+    def default_priority(item: tuple[str, int]):
+        observation = observations[item[0]]
         if config.cache_aware:
             return observation["stale"], observation["token_count"] // SIZE_BUCKET, item[1]
         return observation["stale"], observation["token_count"], -observation["created_at_turn"]
 
-    return sorted(eligible, key=priority, reverse=True)
+    return sorted(eligible, key=default_priority, reverse=True)
 
 
 class StaleObservationEviction:
@@ -120,7 +126,7 @@ class StaleObservationEviction:
         seen_digests: set[str] = set()
         for call_id, position in sorted(positions.items(), key=lambda item: -item[1]):
             observation = candidate.observations.get(call_id)
-            if observation is None or observation["masked"] or observation["pinned"]:
+            if observation is None or observation["masked"] or observation["pinned"] or not observation["recoverable"]:
                 continue
             duplicate = observation["digest"] in seen_digests
             seen_digests.add(observation["digest"])

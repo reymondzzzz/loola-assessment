@@ -6,7 +6,7 @@ sys.path.insert(0, str(BENCH_DIR.parent))
 from generate import make_workdir  # noqa: E402
 from tickets import TICKETS, VISIBLE_TESTS_DIR  # noqa: E402
 from baseline import langgraph_port  # noqa: E402
-from harness.config import MODES, mode_config  # noqa: E402
+from harness.config import EVICTION_POLICIES, MODES, mode_config  # noqa: E402
 from harness.graph import run_agent  # noqa: E402
 
 RUNS_DIR = BENCH_DIR / "runs"
@@ -52,7 +52,7 @@ def score(workdir: Path, state: dict, protected_digest: dict[str, str]) -> dict:
             "success": all(final_checks) and tests_untouched and data_untouched}
 
 
-def run_once(label: str, seed: int, mode: str, context_window: int) -> dict:
+def run_once(label: str, seed: int, mode: str, context_window: int, eviction_policy: str = "default") -> dict:
     workdir, bad_commit = make_workdir(seed)
     state_dir = Path(tempfile.mkdtemp(prefix="bench-state-"))
     state_path = state_dir / "state.json"
@@ -65,12 +65,12 @@ def run_once(label: str, seed: int, mode: str, context_window: int) -> dict:
     os.chdir(workdir)
     with open(RUNS_DIR / f"{label}-seed{seed}.log", "w") as log, contextlib.redirect_stdout(log):
         try:
-            metrics = langgraph_port.agent_loop(TASK) if mode == "original" else run_agent(TASK, mode_config(mode, context_window))
+            metrics = langgraph_port.agent_loop(TASK) if mode == "original" else run_agent(TASK, mode_config(mode, context_window, eviction_policy=eviction_policy))
         except Exception as error:  # a crashed run is a failed run, not a crashed benchmark
             print(f"\n💥 {type(error).__name__}: {error}")
             metrics = {"stop_reason": f"crash: {type(error).__name__}"}
     os.chdir(original_cwd)
-    result = {"label": label, "mode": mode, "context_window": context_window, "model": os.environ["LLM_MODEL"], "seed": seed, "wall_seconds": round(time.monotonic() - started, 1),
+    result = {"label": label, "mode": mode, "context_window": context_window, "eviction_policy": eviction_policy, "model": os.environ["LLM_MODEL"], "seed": seed, "wall_seconds": round(time.monotonic() - started, 1),
               **metrics, **score(workdir, json.loads(state_path.read_text()), protected_digest)}
     shutil.rmtree(workdir)
     shutil.rmtree(state_dir)
@@ -84,10 +84,11 @@ def main() -> None:
     parser.add_argument("--first-seed", type=int, default=0)
     parser.add_argument("--mode", choices=("original", *MODES), default="original")
     parser.add_argument("--context-window", type=int, default=BENCH_CONTEXT_WINDOW)
+    parser.add_argument("--eviction-policy", choices=EVICTION_POLICIES, default="default")
     args = parser.parse_args()
     langgraph_port.MAX_TURNS = BENCH_MAX_TURNS
     for seed in range(args.first_seed, args.first_seed + args.runs):
-        result = run_once(args.label, seed, args.mode, args.context_window)
+        result = run_once(args.label, seed, args.mode, args.context_window, args.eviction_policy)
         with open(RESULTS_FILE, "a") as f:
             f.write(json.dumps(result) + "\n")
         print(json.dumps(result))

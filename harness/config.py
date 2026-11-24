@@ -1,5 +1,7 @@
 from dataclasses import dataclass, replace
 
+EVICTION_POLICIES = ("default", "fifo", "size")
+
 
 @dataclass(frozen=True)
 class HarnessConfig:
@@ -16,6 +18,7 @@ class HarnessConfig:
     interaction_pruning: bool = False
     semantic_compaction: bool = False
     cache_aware: bool = False
+    eviction_policy: str = "default"
 
     context_window: int = 400_000
     output_reserve: int = 4096
@@ -33,6 +36,10 @@ class HarnessConfig:
     llm_deadline_seconds: float = 300
     emergency_attempts: int = 2
     loop_limit: int = 3
+
+    def __post_init__(self):
+        if self.eviction_policy not in EVICTION_POLICIES:
+            raise ValueError(f"eviction_policy must be one of {EVICTION_POLICIES}")
 
     @property
     def input_budget(self) -> int:
@@ -52,6 +59,7 @@ MODES = {
 }
 
 
-def mode_config(mode: str, context_window: int | None = None) -> HarnessConfig:
-    config = MODES[mode]
-    return replace(config, context_window=context_window) if context_window else config
+def mode_config(mode: str, context_window: int | None = None, **overrides) -> HarnessConfig:
+    if context_window:
+        overrides["context_window"] = context_window
+    return replace(MODES[mode], **overrides)
