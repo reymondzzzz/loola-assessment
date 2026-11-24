@@ -233,7 +233,8 @@ def build_graph(run: Run):
         for action in actions:
             messages.append({"role": "tool", "tool_call_id": action["id"], "content": action["visible"]})
             run.events.append("tool_result", turn=state["turn"], tool_call_id=action["id"], name=action["name"],
-                              arguments=action["arguments"], code=action["code"], content=action["content"])
+                              arguments=action["arguments"], code=action["code"], content=action["content"],
+                              artifact_id=state["observations"].get(action["id"], {}).get("artifact_id"))
             completed.append({"turn": state["turn"], "tool": action["name"], "code": action["code"]})
             arguments = parsed_arguments(action["arguments"])
             if action["name"] == "load_skill" and action["ok"] and arguments.get("name") in SKILLS.skills:

@@ -282,3 +282,11 @@ All five findings were confirmed against the code before fixing; each fix has a 
    the worst case: reference overhead + one token per id character (checked over 2,000 random ids).
 3. Wrong counts in the docs: the final matrix is 18 runs (29 recorded in total), and the recall ticket
    survived up to 8 compactions (hybrid-16k seed 0), not 6. Corrected in README and here.
+
+## 18. Fix from the fourth review
+- `search_history` re-saved the event's content as an artifact; for spilled bash outputs that content is the
+  bounded preview, so the returned id pointed to a copy without the middle. `tool_result` events now record
+  the full artifact id and `search_history` returns it (graph-level test with a marker in the middle of a
+  ~800 KB output). Limitation: history search indexes the preview of spilled outputs, so text that appears
+  only in the unloaded middle is not searchable; it is reachable via `read_artifact`.
+- README test count updated (55).

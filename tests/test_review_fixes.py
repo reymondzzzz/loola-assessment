@@ -117,3 +117,16 @@ def test_minimal_reference_fits_floor_for_any_artifact_id():
     rng = random.Random(0)
     ids = ["a" + "".join(rng.choice("0123456789abcdef") for _ in range(11)) for _ in range(2000)]
     assert max(count_tokens(minimal_reference(i)) for i in ids) <= MIN_CALL_BUDGET
+
+
+def test_search_history_returns_full_artifact_of_spilled_output(tmp_path, monkeypatch):
+    from harness.config import mode_config
+    monkeypatch.chdir(tmp_path)
+    command = f"{sys.executable} -c \"print('H\\n' * 200_000 + 'MIDDLE-MARKER\\n' + 'T\\n' * 200_000)\""
+    script = [("", [call("bash", {"command": command}, "c1")]),
+              ("", [call("search_history", {"query": "print MIDDLE"}, "c2")])]
+    _, llm = run_script(script, mode_config("masking"))
+    hit = json.loads([m["content"] for m in llm.requests[2]["messages"] if m["role"] == "tool"][1].splitlines()[0])
+    script.append(("", [call("read_artifact", {"artifact_id": hit["artifact_id"], "offset": 200_001, "limit": 3}, "c3")]))
+    _, llm = run_script(script, mode_config("masking"))
+    assert "MIDDLE-MARKER" in [m["content"] for m in llm.requests[3]["messages"] if m["role"] == "tool"][2]

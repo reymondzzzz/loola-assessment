@@ -272,7 +272,7 @@ cp .env.example .env            # LLM_BASE_URL, LLM_API_KEY, LLM_MODEL (any Open
 uv run --env-file .env python agent.py "list files in the current directory"     # AGENT_MODE=lazy by default
 AGENT_MODE=hybrid uv run --env-file .env python agent.py "<task>"
 
-uv run python -m pytest -q tests                                                # 52 deterministic tests
+uv run python -m pytest -q tests                                                # 55 deterministic tests
 uv run --env-file .env python bench/run.py --label hybrid --mode hybrid --runs 2 [--context-window 16000]
 uv run python bench/report.py                                                   # results table
 ```

@@ -35,6 +35,6 @@ def search_history(events: EventStore, artifacts: ArtifactStore, query: str, lim
         event = results[call_id]
         preview = " ".join(event["content"].split())[:300]
         lines.append(json.dumps({"tool_call_id": call_id, "turn": event["turn"], "tool": event["name"],
-                                 "arguments": event["arguments"][:200], "artifact_id": artifacts.save(event["content"]),
+                                 "arguments": event["arguments"][:200], "artifact_id": event.get("artifact_id") or artifacts.save(event["content"]),
                                  "preview": preview}))
     return "\n".join(lines) + "\nUse read_artifact(artifact_id) for full content."
