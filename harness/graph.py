@@ -9,7 +9,7 @@ from langgraph.graph import END, START, StateGraph
 from harness.config import HarnessConfig
 from harness.context import Candidate, ContextManager, build_prompt
 from harness.protocol import protocol_errors
-from harness.executor import ToolExecutor, ToolOutcome
+from harness.executor import ToolExecutor, failure
 from harness.llm import ContextOverflow, LLMClient
 from harness.memory import MEMORY_TOOL_SCHEMAS, read_artifact, search_history
 from harness.metrics import MetricsCollector
@@ -25,7 +25,6 @@ RECOVERY_TOOLS = {"read_artifact", "search_history"}
 
 class AgentState(TypedDict):
     task: str
-    constraints: list[str]
     active_messages: list[dict]
     summary: dict
     observations: dict
@@ -196,6 +195,12 @@ def build_graph(run: Run):
                                 loop_limit=run.config.loop_limit, extra_tools=memory_tools, **state["executor"])
         results = []
         for action in state["pending_actions"]:
+            if run.metrics.counters["tool_calls"] >= run.config.max_tool_calls:
+                outcome = failure("BUDGET_EXHAUSTED", "The tool-call budget of this run is exhausted; this call was "
+                                  "not executed.", model_can_repair=False)
+                results.append({**action, **vars(outcome)})
+                run.metrics.count("tool_calls_refused")
+                continue
             outcome = executor.execute(action["name"], action["arguments"])
             run.metrics.count("tool_calls")
             run.metrics.count(f"tool_code_{outcome.code}")
@@ -279,7 +284,7 @@ def build_graph(run: Run):
 
 
 def initial_state(task: str, config: HarnessConfig) -> AgentState:
-    return AgentState(task=task, constraints=[], active_messages=[], summary={}, observations={}, active_skills={},
+    return AgentState(task=task, active_messages=[], summary={}, observations={}, active_skills={},
                       active_tools=initial_tools(mode_name(config)), completed_actions=[], pending_actions=[],
                       context_epoch=0, status="running", turn=0, request=[], request_tokens=0, calibration=1.0,
                       overflow_attempts=0, response={},

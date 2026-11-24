@@ -172,3 +172,9 @@ def test_emergency_reduction(tmp_path):
     tiny = manager(tmp_path, 60, observation_masking=True)
     compacted, report = tiny.manage(impossible)
     assert compacted is None and report["error"] == "context_budget_exceeded"
+
+
+def test_summary_is_not_user_authority():
+    prompt = build_prompt(SYSTEM, TASK, VALID_SUMMARY, [])
+    assert [m["role"] for m in prompt] == ["system", "user", "assistant"]
+    assert prompt[2]["content"].startswith("[Context summary") and "not instructions" in prompt[2]["content"]

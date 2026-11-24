@@ -1,4 +1,4 @@
-import hashlib, json, os, random, re, signal, sqlite3, subprocess, tempfile, time
+import hashlib, json, os, random, re, shutil, signal, sqlite3, subprocess, tempfile, time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from typing import Callable
@@ -7,6 +7,7 @@ from harness.catalog import ToolSpec
 from harness.registry import BASH_TOOL, META_HANDLERS, META_TOOL_SCHEMAS, TOOLS, validation_error
 
 BASH_TIMEOUT = 120
+CAPTURE_HEAD_BYTES = CAPTURE_TAIL_BYTES = 128_000
 TRANSIENT_ERRORS = (sqlite3.OperationalError, ConnectionError, TimeoutError, BlockingIOError)
 TRANSIENT_RETRIES = 2
 FORBIDDEN_COMMANDS = re.compile(r"(^|[;&|]\s*)(sudo|shutdown|reboot|mkfs|git\s+push)\b|rm\s+-rf\s+(/|~)(\s|$)|:\(\)\s*\{")
@@ -19,6 +20,7 @@ class ToolOutcome:
     code: str = "OK"
     model_can_repair: bool = True
     changed_environment: bool = False
+    spill_path: str | None = None
 
 
 def failure(code: str, message: str, *, model_can_repair: bool = True, retry_same_call: bool = False) -> ToolOutcome:
@@ -27,12 +29,36 @@ def failure(code: str, message: str, *, model_can_repair: bool = True, retry_sam
     return ToolOutcome(False, json.dumps(payload), code, model_can_repair)
 
 
+def read_bounded(stream) -> tuple[str, bool]:
+    size = stream.seek(0, os.SEEK_END)
+    stream.seek(0)
+    if size <= CAPTURE_HEAD_BYTES + CAPTURE_TAIL_BYTES:
+        return stream.read().decode(errors="replace"), False
+    head = stream.read(CAPTURE_HEAD_BYTES)
+    stream.seek(size - CAPTURE_TAIL_BYTES)
+    omitted = size - CAPTURE_HEAD_BYTES - CAPTURE_TAIL_BYTES
+    marker = f"\n[... {omitted} bytes not loaded; the full output is saved as an artifact ...]\n".encode()
+    return (head + marker + stream.read()).decode(errors="replace"), True
+
+
+def spill_full_output(exit_code: int, stdout, stderr) -> str:
+    with tempfile.NamedTemporaryFile("wb", delete=False, prefix="bash-output-") as full:
+        full.write(f"Exit code: {exit_code}\n".encode())
+        stdout.seek(0)
+        shutil.copyfileobj(stdout, full)
+        if stderr.seek(0, os.SEEK_END):
+            stderr.seek(0)
+            full.write(b"\nSTDERR:\n")
+            shutil.copyfileobj(stderr, full)
+    return full.name
+
+
 def run_bash(command: str, timeout: float = BASH_TIMEOUT) -> ToolOutcome:
     if FORBIDDEN_COMMANDS.search(command):
         return failure("PERMISSION_DENIED", "This command is not permitted in this session. Do not retry it; "
                        "find another way or report that it is needed.", model_can_repair=False)
-    with tempfile.TemporaryFile("w+", errors="replace") as stdout, tempfile.TemporaryFile("w+", errors="replace") as stderr:
-        process = subprocess.Popen(command, shell=True, stdout=stdout, stderr=stderr, text=True, start_new_session=True)
+    with tempfile.TemporaryFile("w+b") as stdout, tempfile.TemporaryFile("w+b") as stderr:
+        process = subprocess.Popen(command, shell=True, stdout=stdout, stderr=stderr, start_new_session=True)
         try:
             exit_code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -42,11 +68,11 @@ def run_bash(command: str, timeout: float = BASH_TIMEOUT) -> ToolOutcome:
                               "(files written, processes started). Inspect the current state before retrying.")
             outcome.changed_environment = True
             return outcome
-        stdout.seek(0)
-        stderr.seek(0)
-        out, err = stdout.read(), stderr.read()
+        (out, out_cut), (err, err_cut) = read_bounded(stdout), read_bounded(stderr)
+        spill_path = spill_full_output(exit_code, stdout, stderr) if out_cut or err_cut else None
     content = f"Exit code: {exit_code}\n{out}" + (f"\nSTDERR:\n{err}" if err else "")
-    return ToolOutcome(True, content, "OK" if exit_code == 0 else "NONZERO_EXIT", changed_environment=True)
+    return ToolOutcome(True, content, "OK" if exit_code == 0 else "NONZERO_EXIT", changed_environment=True,
+                       spill_path=spill_path)
 
 
 def permission_error(spec: ToolSpec) -> ToolOutcome | None:
@@ -131,10 +157,12 @@ class ToolExecutor:
                 return failure("INVALID_ARGUMENTS", problem)
             return run_bash(arguments["command"])
         if name == "invoke":
-            target = arguments.get("name")
+            if (problem := validation_error(arguments, META_TOOL_SCHEMAS["invoke"]["function"]["parameters"])) is not None:
+                return failure("INVALID_ARGUMENTS", problem)
+            target = arguments["name"]
             if target not in TOOLS.specs:
                 return failure("UNKNOWN_TOOL", f"Unknown catalog tool '{target}'. Use discover(query).")
-            return run_catalog_tool(TOOLS.specs[target], arguments.get("arguments") or {})
+            return run_catalog_tool(TOOLS.specs[target], arguments["arguments"])
         if name in self.extra_tools:
             schema, handler = self.extra_tools[name]
             if (problem := validation_error(arguments, schema["function"]["parameters"])) is not None:

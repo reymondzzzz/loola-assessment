@@ -65,12 +65,15 @@ def filtered(kind: str, tool: str, text: str) -> str:
 def head_tail(text: str, budget: int, artifact_id: str, original_tokens: int) -> str:
     if count_tokens(text) <= budget:
         return text
+    minimal = f"[truncated; read_artifact('{artifact_id}')]"
     lines = text.splitlines()
     if len(lines) < 3:
         lines = [text[i:i + 200] for i in range(0, len(text), 200)]
     reference = (f"[... {{omitted}} of {len(lines)} lines omitted; original {original_tokens} tokens. "
                  f"Full output: read_artifact('{artifact_id}', offset, limit) ...]")
-    content_budget = max(budget - count_tokens(reference) - 8, 16)
+    content_budget = budget - count_tokens(reference.format(omitted=len(lines))) - 2
+    if content_budget < 8:
+        return minimal
     head, used = [], 0
     for line in lines:
         cost = count_tokens(line) + 1
@@ -85,15 +88,18 @@ def head_tail(text: str, budget: int, artifact_id: str, original_tokens: int) ->
             break
         tail.insert(0, line)
         used += cost
-    omitted = len(lines) - len(head) - len(tail)
-    return "\n".join([*head, reference.format(omitted=omitted), *tail])
+    while True:
+        result = "\n".join([*head, reference.format(omitted=len(lines) - len(head) - len(tail)), *tail])
+        if count_tokens(result) <= budget or not (head or tail):
+            return result if count_tokens(result) <= budget else minimal
+        (tail.pop(0) if len(tail) >= len(head) else head.pop())
 
 
 def per_call_budgets(actions: list[dict], config: HarnessConfig, available_tokens: int) -> list[int]:
     limits = [TOOLS.specs[a["tool"]].max_output_tokens if a["tool"] in TOOLS.specs else config.tool_output_tokens
               for a in actions]
     turn_budget = min(sum(limits), max(int(available_tokens * 0.2), 256))
-    share = turn_budget // max(len(actions), 1)
+    share = max(turn_budget // max(len(actions), 1), 64)
     return [min(limit, share) for limit in limits]
 
 
@@ -115,8 +121,12 @@ class OutputProcessor:
             content, tool, arguments = action["content"], action["tool"], action["tool_arguments"]
             kind = observation_kind(tool, arguments)
             digest = hashlib.sha256(content.encode()).hexdigest()
-            artifact_id = self.artifacts.save(content)
-            original_tokens = count_tokens(content)
+            if action.get("spill_path"):
+                artifact_id = self.artifacts.save_file(action["spill_path"])
+                original_tokens = (self.artifacts.directory / f"{artifact_id}.txt").stat().st_size // 4
+            else:
+                artifact_id = self.artifacts.save(content)
+                original_tokens = count_tokens(content)
             visible, duplicate_of = content, None
             if action["ok"]:
                 if self.config.deduplication and digest in visible_digests:

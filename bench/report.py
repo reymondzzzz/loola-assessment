@@ -4,7 +4,7 @@ from pathlib import Path
 
 RESULTS_FILE = Path(__file__).resolve().parent / "results.jsonl"
 COLUMNS = [("runs", None), ("success", "success"), ("tickets", "tickets_closed"), ("turns", "turns"),
-           ("input tok", "input_tokens"), ("cached %", None), ("uncached tok", None), ("output tok", "output_tokens"),
+           ("input tok (incl. summarizer)", "input_tokens"), ("cached %", None), ("uncached tok", None), ("output tok", "output_tokens"),
            ("summarizer tok", None), ("peak ctx", "peak_context"), ("compactions", "compactions"),
            ("wall s", "wall_seconds")]
 
@@ -16,8 +16,8 @@ def mean(values: list[float]) -> str:
 def row(label: str, runs: list[dict]) -> str:
     cells = [label, str(len(runs)), f"{sum(r['success'] for r in runs)}/{len(runs)}",
              mean([r.get("tickets_closed", 0) for r in runs]), mean([r.get("turns", 0) for r in runs])]
-    inputs = [r.get("input_tokens", 0) for r in runs]
-    cached = [r.get("cached_tokens", 0) for r in runs]
+    inputs = [r.get("total_input_tokens", r.get("input_tokens", 0)) for r in runs]
+    cached = [r.get("total_cached_tokens", r.get("cached_tokens", 0)) for r in runs]
     cells += [mean(inputs), f"{100 * sum(cached) / max(sum(inputs), 1):.0f}%",
               mean([i - c for i, c in zip(inputs, cached)]), mean([r.get("output_tokens", 0) for r in runs]),
               mean([r.get("summarizer_input_tokens", 0) + r.get("summarizer_output_tokens", 0) for r in runs]),

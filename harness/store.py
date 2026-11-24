@@ -1,4 +1,4 @@
-import hashlib, json, os, tempfile, time, uuid
+import hashlib, json, os, shutil, tempfile, time, uuid
 from pathlib import Path
 
 RUNS_ROOT = Path(os.environ.get("AGENT_RUNS_DIR", Path(tempfile.gettempdir()) / "agent-runs"))
@@ -44,12 +44,28 @@ class ArtifactStore:
             path.write_text(content)
         return artifact_id
 
+    def save_file(self, path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1 << 20), b""):
+                digest.update(chunk)
+        artifact_id = "a" + digest.hexdigest()[:11]
+        target = self.directory / f"{artifact_id}.txt"
+        if target.exists():
+            os.remove(path)
+        else:
+            shutil.move(path, target)
+        return artifact_id
+
     def exists(self, artifact_id: str) -> bool:
         return (self.directory / f"{artifact_id}.txt").is_file()
 
     def read(self, artifact_id: str, offset: int = 1, limit: int = 200) -> str | None:
         if not artifact_id.isalnum() or not self.exists(artifact_id):
             return None
-        lines = (self.directory / f"{artifact_id}.txt").read_text().splitlines()
-        shown = lines[offset - 1:offset - 1 + limit]
-        return "\n".join(shown) + f"\n[artifact {artifact_id}: lines {offset}-{offset + len(shown) - 1} of {len(lines)}]"
+        shown, total = [], 0
+        with open(self.directory / f"{artifact_id}.txt", errors="replace") as source:
+            for total, line in enumerate(source, start=1):
+                if offset <= total < offset + limit:
+                    shown.append(line.rstrip("\n"))
+        return "\n".join(shown) + f"\n[artifact {artifact_id}: lines {offset}-{offset + len(shown) - 1} of {total}]"
