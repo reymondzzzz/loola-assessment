@@ -36,6 +36,9 @@ class HarnessConfig:
     llm_deadline_seconds: float = 300
     emergency_attempts: int = 2
     loop_limit: int = 3
+    verify_command: str | None = None
+    verify_timeout: float = 300
+    verify_attempts: int = 2
 
     def __post_init__(self):
         if self.eviction_policy not in EVICTION_POLICIES:
