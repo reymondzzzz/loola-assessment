@@ -259,3 +259,16 @@ All five findings were confirmed against the code before fixing; each fix has a 
    `max(min(Σ limits, 20% free), n × MIN_CALL_BUDGET)`, where MIN_CALL_BUDGET is the size of the minimal
    artifact reference (`[artifact a…]`), and `head_tail` never exceeds a budget ≥ that floor.
    A multi-epoch graph test needed a longer scenario because outputs are now smaller.
+
+## 16. Part 5 results
+- Final matrix: 30 real runs, all 11/11 tickets (incl. the recall ticket after up to 6 compactions).
+  Tables and interpretation in README §10. 100k matrix on `fe022a1` (no compaction can trigger there);
+  16k compaction trio re-run on `dfe7a3c`, same seeds. Older rows kept with `-pre`/`-part1` labels.
+- Main findings: fixed per-call cost 2,887 (eager) vs 576 (lazy) tokens; the output pipeline cut peak
+  context from ~30k to 16–19k; at 16k deterministic masking was the cheapest (55k uncached vs 92k hybrid,
+  101k summary-only, which spent ~99k tokens on 2 summaries and had the lowest cache hit rate, 71%).
+  Hypothesis partly supported: hybrid < summary-only on uncached and summarizer tokens at equal success, but
+  masking alone was enough on this task.
+- Privacy pass before publishing: run logs contained the home path and `ls -la` owner name; replaced with
+  `<repo>`, `~` and `user`. Three logs committed earlier still contain the path in history; not rewritten,
+  because commit author name/email are public anyway and rewriting would change hashes cited in the docs.

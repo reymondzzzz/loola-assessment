@@ -59,12 +59,12 @@ Traceback:
    → Exit code: 0
 /private/var/folders/f8/py7q8bqj1sl4qgqm1zypfx440000gn/T/bench-0-5hc3ecv1
 total 16
-drwxr-xr-x    10 kirillstarkov  staff    320 24 нояб. 14:15 .
-drwx------@ 1608 kirillstarkov  staff  51456 24 нояб. 14:15 ..
-drwxr-xr-x    12 kirillstarkov  staff    384 24 нояб. 14:15 .git
-drwxr-xr-x     6 kirillstarkov  staff    192 24 нояб. 14:15 .pytest_cache
--rw-r--r--     1 kirillstarkov  staff    797 24 нояб. 14:15 CHANGES.md
-drwxr-xr-x     5 kirillstarkov  staff    160 24 нояб. 14:15 data
+drwxr-xr-x    10 user  staff    320 24 нояб. 14:15 .
+drwx------@ 1608 user  staff  51456 24 нояб. 14:15 ..
+drwxr-xr-x    12 user  staff    384 24 нояб. 14:15 .git
+drwxr-xr-x     6 user  staff    192 24 нояб. 14:15 .pytest_cache
+-rw-r--r--     1 user  staff    797 24 нояб. 14:15 CHANGES.md
+drwxr-xr-x     5 user  staff    160 24 нояб. 14:15 data
 drwx...
 
 ============================================================
