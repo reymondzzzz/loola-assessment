@@ -6,7 +6,6 @@ BENCH_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BENCH_DIR.parent))
 from generate import make_workdir  # noqa: E402
 from tickets import TICKETS, VISIBLE_TESTS_DIR  # noqa: E402
-from baseline import langgraph_port  # noqa: E402
 from harness.config import EVICTION_POLICIES, MODES, mode_config  # noqa: E402
 from harness.graph import run_agent  # noqa: E402
 
@@ -113,6 +112,8 @@ def run_once(label: str, seed: int, mode: str, context_window: int, eviction_pol
             if mode == "original":
                 metrics = run_literal_original(TASK)
             elif mode == "original-port":
+                langgraph_port = importlib.import_module("baseline.langgraph_port")
+                langgraph_port.MAX_TURNS = BENCH_MAX_TURNS
                 metrics = langgraph_port.agent_loop(TASK)
             else:
                 metrics = run_agent(TASK, mode_config(mode, context_window, eviction_policy=eviction_policy))
@@ -136,7 +137,6 @@ def main() -> None:
     parser.add_argument("--context-window", type=int, default=BENCH_CONTEXT_WINDOW)
     parser.add_argument("--eviction-policy", choices=EVICTION_POLICIES, default="default")
     args = parser.parse_args()
-    langgraph_port.MAX_TURNS = BENCH_MAX_TURNS
     for seed in range(args.first_seed, args.first_seed + args.runs):
         result = run_once(args.label, seed, args.mode, args.context_window, args.eviction_policy)
         with open(RESULTS_FILE, "a") as f:

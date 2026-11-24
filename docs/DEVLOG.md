@@ -421,3 +421,11 @@ All five findings were confirmed against the code before fixing; each fix has a 
   resume through the CLI), `tests/test_repeat_hints.py` (run_tests exit codes, bash hint without blocking and
   reset after a change, failing no-op bash does not bump the version, run_tests hint then LOOP_DETECTED, hint
   reaches the model through the graph). Not implemented: progress memory in the checkpoint, fixed common tools.
+
+## 26. Final verification
+- `bench/run.py --help` failed without LLM env vars because the port reads `os.environ` at import; the port is
+  now imported lazily for `--mode original-port` (route test added).
+- `git diff --check` flagged trailing whitespace only inside recorded run logs (raw agent/tool output kept as
+  evidence); `.gitattributes` marks `bench/runs/*.log -whitespace`. Code and docs are clean.
+- Checks: 80 tests pass; baseline SHA-256 `d1e005f6…eb1c` matches the provided file; `agent.py` (no task,
+  `--help`), `bench/run.py --help` work; no keys or personal data in tracked files; working tree clean.

@@ -38,3 +38,19 @@ def test_original_mode_runs_the_provided_file_unchanged(tmp_path, monkeypatch):
     assert result["tool_calls"] == 1 and result["input_tokens"] > 0 and result["tickets_closed"] == 0
     assert result["success"] is False and result["code_revision"]
     assert hashlib.sha256(ORIGINAL.read_bytes()).hexdigest() == PROVIDED_SHA256
+
+
+def test_original_port_mode_imports_lazily_and_runs(tmp_path, monkeypatch):
+    sys.path.insert(0, str(ROOT / "bench"))
+    import run as bench_run
+    server = FakeOpenAI([("stopping here", [])])
+    monkeypatch.setenv("LLM_BASE_URL", server.url)
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_MODEL", "fake-model")
+    monkeypatch.setattr(bench_run, "RUNS_DIR", tmp_path / "runs")
+    try:
+        result = bench_run.run_once("port-route-test", 0, "original-port", 100_000)
+    finally:
+        server.close()
+    assert result["mode"] == "original-port" and result["stop_reason"] == "finished" and result["turns"] == 1
+    assert "temperature" not in server.requests[0]
