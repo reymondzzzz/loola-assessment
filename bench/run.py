@@ -38,7 +38,7 @@ def install_tickets_command(workdir: Path, state_path: Path) -> None:
 
 def tests_intact(workdir: Path, current_ticket: int) -> bool:
     issued = {ticket.visible_test for ticket in TICKETS[:min(current_ticket, len(TICKETS) - 1) + 1] if ticket.visible_test}
-    present = {path.name for path in (workdir / "tests").iterdir() if path.name != ".gitkeep"}
+    present = {path.name for path in (workdir / "tests").iterdir() if path.name not in (".gitkeep", "__pycache__")}
     return present == issued and all(
         (VISIBLE_TESTS_DIR / name).read_bytes() == (workdir / "tests" / name).read_bytes() for name in issued)
 

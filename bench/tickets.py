@@ -23,7 +23,7 @@ class Ticket:
 
 
 def run_pytest(workdir: Path, *test_files: str) -> tuple[bool, str]:
-    result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *test_files],
+    result = subprocess.run([sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", *test_files],
                             cwd=workdir, capture_output=True, text=True, timeout=180)
     return result.returncode == 0, "\n".join((result.stdout + result.stderr).splitlines()[-25:])
 

@@ -32,7 +32,7 @@ def test_compaction_epochs_keep_stable_head_and_task(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     config = replace(mode_config("hybrid", context_window=12_000), output_reserve=1000, safety_margin=500,
                      recent_interactions=2)
-    metrics, llm = run_script(noisy_script(30, lines=400), config, TASK, summary=SUMMARY)
+    metrics, llm = run_script(noisy_script(60, lines=400), config, TASK, summary=SUMMARY)
     assert metrics["stop_reason"] == "finished" and metrics["compactions"] >= 2
     head = llm.requests[0]["messages"][:2]
     assert all(r["messages"][:2] == head and r["tools"] == llm.requests[0]["tools"] for r in llm.requests)

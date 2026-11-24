@@ -245,3 +245,17 @@ All five findings were confirmed against the code before fixing; each fix has a 
    are kept as `*-16k-pre`. `bench/report.py` now counts summarizer tokens in total input.
 - Also: removed the unused `constraints` state field (the task is protected by its fixed prompt slot and
   validation); rewrote the outdated `AGENTS.md`.
+
+## 15. Fixes from the second review
+1. Malformed `invoke` still crashed the graph: the dispatcher returned INVALID_ARGUMENTS, but the output
+   processor re-parsed the raw arguments and called `.get` on a string. `effective_call` now only accepts a
+   dict; regression test goes through `run_agent` (`test_malformed_invoke_does_not_crash_the_graph`).
+2. Benchmark scoring would fail correct solutions: pytest (the agent's and the checker's) writes
+   `tests/__pycache__`, which `tests_intact` counted as an extra file. `__pycache__` is ignored and the
+   checker runs `python -B`. The in-flight 16k re-runs used this broken scoring, so they were stopped and
+   discarded before writing results.
+3. Shared output budget exceeded the 20% rule (8 calls, 1000 free tokens → 512 instead of 200) because of a
+   per-call minimum of 64 on top of the turn budget. Now the turn budget is
+   `max(min(Σ limits, 20% free), n × MIN_CALL_BUDGET)`, where MIN_CALL_BUDGET is the size of the minimal
+   artifact reference (`[artifact a…]`), and `head_tail` never exceeds a budget ≥ that floor.
+   A multi-epoch graph test needed a longer scenario because outputs are now smaller.

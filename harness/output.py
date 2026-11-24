@@ -16,7 +16,8 @@ HEAD_SHARE = 0.3
 
 def effective_call(name: str, arguments: dict) -> tuple[str, dict]:
     if name == "invoke":
-        return str(arguments.get("name")), arguments.get("arguments") or {}
+        inner = arguments.get("arguments")
+        return str(arguments.get("name")), inner if isinstance(inner, dict) else {}
     return name, arguments
 
 
@@ -62,10 +63,17 @@ def filtered(kind: str, tool: str, text: str) -> str:
     return text
 
 
+def minimal_reference(artifact_id: str) -> str:
+    return f"[artifact {artifact_id}]"
+
+
+MIN_CALL_BUDGET = count_tokens(minimal_reference("a0123456789a"))
+
+
 def head_tail(text: str, budget: int, artifact_id: str, original_tokens: int) -> str:
     if count_tokens(text) <= budget:
         return text
-    minimal = f"[truncated; read_artifact('{artifact_id}')]"
+    minimal = minimal_reference(artifact_id)
     lines = text.splitlines()
     if len(lines) < 3:
         lines = [text[i:i + 200] for i in range(0, len(text), 200)]
@@ -98,8 +106,8 @@ def head_tail(text: str, budget: int, artifact_id: str, original_tokens: int) ->
 def per_call_budgets(actions: list[dict], config: HarnessConfig, available_tokens: int) -> list[int]:
     limits = [TOOLS.specs[a["tool"]].max_output_tokens if a["tool"] in TOOLS.specs else config.tool_output_tokens
               for a in actions]
-    turn_budget = min(sum(limits), max(int(available_tokens * 0.2), 256))
-    share = max(turn_budget // max(len(actions), 1), 64)
+    turn_budget = max(min(sum(limits), int(available_tokens * 0.2)), MIN_CALL_BUDGET * len(actions))
+    share = turn_budget // max(len(actions), 1)
     return [min(limit, share) for limit in limits]
 
 
