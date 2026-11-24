@@ -351,3 +351,22 @@ All five findings were confirmed against the code before fixing; each fix has a 
   is in `META_HANDLERS`, so an interrupted `invoke(edit_file)` would have been repeated on resume. `invoke`
   is now judged by its target tool's spec (read-only and idempotent only); test covers invoke of
   read_file/edit_file/write_file/malformed, bash, meta and direct catalog tools.
+
+## 22. 4/5: late requirement changes and repeated-call metric (§16)
+- `agent.py --resume RUN_ID --message "…"` adds a user requirement to a started run (finished, stopped
+  or crashed). Requirements are stored in state and rendered as `user` messages right after the original
+  task: `[Requirement update N, added after turn T. Where it conflicts with the original task, this update
+  wins.]`. They are part of the pinned head: compaction validation rejects any candidate where task or
+  requirement messages changed, and the summarizer receives them verbatim. Adding one changes the prompt head
+  once (one cache miss) — accepted, because a real requirement change has to be visible to the model.
+  For a finished run the state is updated as if `state_update` ran (status back to running) and the loop
+  continues from `context_manager`; for an interrupted run only the requirements change and execution
+  continues at the pending node.
+- `repeated_tool_calls`: number of tool calls whose tool name and arguments, normalized to JSON with sorted
+  keys and no whitespace, equal an earlier call of the same run (malformed JSON arguments compare as raw
+  text; `invoke` compares the whole call including the inner tool name and arguments). Reported in run
+  metrics and benchmark results; `bench/report.py` shows `—` for older rows without the field.
+- Tests: end-to-end through the CLI and the fake server — a run finishes after its first action; resume with
+  a requirement in a new process under a 12k window (hybrid); every later request carries task + requirement
+  as user messages; ≥ 1 compaction happens; the independent check of `out.txt` sees the changed result.
+  Metric: key order does not matter (repeat counted), a changed argument is not a repeat.

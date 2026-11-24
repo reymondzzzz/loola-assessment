@@ -10,14 +10,20 @@ def tool_call(name: str, arguments: dict, call_id: str) -> dict:
 class FakeOpenAI:
     """OpenAI-compatible /chat/completions server replaying scripted replies, for end-to-end CLI tests."""
 
-    def __init__(self, replies: list[tuple[str, list[dict]]], hold_requests: set[int] = frozenset()):
+    def __init__(self, replies: list[tuple[str, list[dict]]], hold_requests: set[int] = frozenset(),
+                 summary: dict | None = None):
         self.replies, self.requests, self.hold_requests = list(replies), [], set(hold_requests)
+        self.summary, self.summary_requests = summary, []
         self.request_arrived, self.release = threading.Condition(), threading.Event()
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if "tools" not in body:
+                    fake.summary_requests.append(body)
+                    self.reply(body, len(fake.summary_requests), json.dumps(fake.summary or {}), [])
+                    return
                 with fake.request_arrived:
                     index = len(fake.requests)
                     fake.requests.append(body)
@@ -26,6 +32,9 @@ class FakeOpenAI:
                     fake.release.wait(30)
                     return
                 content, calls = fake.replies.pop(0) if fake.replies else ("done", [])
+                self.reply(body, index, content, calls)
+
+            def reply(self, body, index, content, calls):
                 message = {"role": "assistant", "content": content or None, **({"tool_calls": calls} if calls else {})}
                 payload = {"id": f"chatcmpl-{index}", "object": "chat.completion", "created": 0, "model": body["model"],
                            "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if calls else "stop"}],

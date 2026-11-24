@@ -26,5 +26,6 @@ class MetricsCollector:
         counters = dict(self.counters)
         total_input = counters.get("input_tokens", 0) + counters.get("summarizer_input_tokens", 0)
         total_cached = counters.get("cached_tokens", 0) + counters.get("summarizer_cached_tokens", 0)
-        return {**counters, "peak_context": self.peak_context, "total_input_tokens": total_input,
+        return {**counters, "repeated_tool_calls": counters.get("repeated_tool_calls", 0),
+                "peak_context": self.peak_context, "total_input_tokens": total_input,
                 "total_cached_tokens": total_cached, "total_uncached_input_tokens": total_input - total_cached}

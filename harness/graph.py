@@ -45,6 +45,8 @@ class AgentState(TypedDict):
     response: dict
     executor: dict
     metrics: dict
+    requirements: list[dict]
+    call_signatures: list[str]
 
 
 @dataclass
@@ -67,7 +69,8 @@ def parsed_arguments(raw: str) -> dict:
 
 
 def build_request(state: AgentState, config: HarnessConfig) -> list[dict]:
-    return build_prompt(system_prompt(config), state["task"], state["summary"], state["active_messages"])
+    return build_prompt(system_prompt(config), state["task"], state["summary"], state["active_messages"],
+                        state["requirements"])
 
 
 def to_candidate(state: AgentState) -> Candidate:
@@ -105,13 +108,21 @@ def mark_stale(observations: dict, turn: int, environment_changed: bool) -> dict
     return observations
 
 
+def call_signature(action: dict) -> str:
+    try:
+        arguments = json.dumps(json.loads(action["arguments"] or "{}"), sort_keys=True, separators=(",", ":"))
+    except json.JSONDecodeError:
+        arguments = action["arguments"]
+    return f"{action['name']}:{arguments}"
+
+
 def build_graph(run: Run, checkpointer):
     processor = OutputProcessor(run.config, run.artifacts)
 
     def context_window_manager(state: AgentState) -> ContextManager:
         summarize = lambda request: run.llm.complete(request, [], purpose="summarizer")[0]  # noqa: E731
         return ContextManager(run.config, run.artifacts, system_prompt(run.config), state["task"],
-                              state["active_tools"], summarize, state["completed_actions"])
+                              state["active_tools"], summarize, state["completed_actions"], state["requirements"])
 
     def compact(state: AgentState, force: bool) -> tuple[dict, dict]:
         candidate, report = context_window_manager(state).manage(to_candidate(state), state["calibration"], force)
@@ -192,7 +203,7 @@ def build_graph(run: Run, checkpointer):
                                            lambda **a: search_history(run.events, run.artifacts if run.config.artifact_offloading else None, **a))}
         executor = ToolExecutor(available={tool["function"]["name"] for tool in state["active_tools"]},
                                 loop_limit=run.config.loop_limit, extra_tools=memory_tools, **state["executor"])
-        results = []
+        results, signatures = [], list(state["call_signatures"])
         journal = {}
         for event in run.events.read():
             if event["kind"] in ("tool_started", "tool_finished"):
@@ -215,6 +226,10 @@ def build_graph(run: Run, checkpointer):
                 results.append({**action, **vars(outcome)})
                 run.metrics.count("tool_calls_refused")
                 continue
+            signature = call_signature(action)
+            if signature in signatures:
+                run.metrics.count("repeated_tool_calls")
+            signatures.append(signature)
             run.events.append("tool_started", tool_call_id=action["id"], name=action["name"], arguments=action["arguments"])
             outcome = executor.execute(action["name"], action["arguments"])
             run.events.append("tool_finished", tool_call_id=action["id"], outcome=vars(outcome))
@@ -228,7 +243,7 @@ def build_graph(run: Run, checkpointer):
                   f"{'...' if len(outcome.content) > 500 else ''}")
             results.append({**action, **vars(outcome)})
         executed_state = {"environment_version": executor.environment_version, "failures": executor.failures}
-        return {"pending_actions": results, "executor": executed_state}
+        return {"pending_actions": results, "executor": executed_state, "call_signatures": signatures}
 
     def output_processor(state: AgentState) -> dict:
         available = run.config.input_budget - state["request_tokens"]
@@ -307,7 +322,7 @@ def initial_state(task: str, config: HarnessConfig) -> AgentState:
     return AgentState(task=task, active_messages=[], summary={}, observations={}, active_skills={},
                       active_tools=initial_tools(config), completed_actions=[], pending_actions=[],
                       context_epoch=0, status="running", turn=0, request=[], request_tokens=0, calibration=1.0,
-                      overflow_attempts=0, response={}, metrics={},
+                      overflow_attempts=0, response={}, metrics={}, requirements=[], call_signatures=[],
                       executor={"environment_version": 0, "failures": {}})
 
 
@@ -342,7 +357,7 @@ def run_agent(task: str, config: HarnessConfig, llm: LLMClient | None = None) ->
     return execute(run, build_graph(run, checkpointer), initial_state(task, config))
 
 
-def resume_agent(run_id: str, llm: LLMClient | None = None) -> dict:
+def resume_agent(run_id: str, message: str | None = None, llm: LLMClient | None = None) -> dict:
     run_dir = run_dir_for(run_id)
     if not (run_dir / "config.json").exists():
         raise FileNotFoundError(f"no run {run_id} in {run_dir.parent}")
@@ -353,5 +368,13 @@ def resume_agent(run_id: str, llm: LLMClient | None = None) -> dict:
     run.metrics = MetricsCollector(snapshot.values.get("metrics"))
     run.llm.metrics = run.metrics
     run.events.append("resume", pending_nodes=list(snapshot.next))
+    if message:
+        requirements = [*snapshot.values["requirements"], {"text": message, "turn": snapshot.values["turn"]}]
+        run.events.append("requirement_update", turn=snapshot.values["turn"], text=message)
+        if snapshot.next:
+            graph.update_state(graph_config(run), {"requirements": requirements})
+        else:
+            graph.update_state(graph_config(run), {"requirements": requirements, "status": "running"}, as_node="state_update")
+        snapshot = graph.get_state(graph_config(run))
     print(f"🆔 Resuming run {run_id} at {list(snapshot.next) or 'end'}", flush=True)
     return execute(run, build_graph(run, checkpointer), None)

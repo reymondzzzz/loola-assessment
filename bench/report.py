@@ -6,6 +6,7 @@ RESULTS_FILE = Path(__file__).resolve().parent / "results.jsonl"
 COLUMNS = [("runs", None), ("success", "success"), ("tickets", "tickets_closed"), ("turns", "turns"),
            ("input tok (incl. summarizer)", "input_tokens"), ("cached %", None), ("uncached tok", None), ("output tok", "output_tokens"),
            ("summarizer tok", None), ("peak ctx", "peak_context"), ("compactions", "compactions"),
+           ("repeated calls", None),
            ("wall s", "wall_seconds")]
 
 
@@ -22,6 +23,7 @@ def row(label: str, runs: list[dict]) -> str:
               mean([i - c for i, c in zip(inputs, cached)]), mean([r.get("output_tokens", 0) for r in runs]),
               mean([r.get("summarizer_input_tokens", 0) + r.get("summarizer_output_tokens", 0) for r in runs]),
               mean([r.get("peak_context", 0) for r in runs]), mean([r.get("compactions", 0) for r in runs]),
+              mean([r["repeated_tool_calls"] for r in runs if "repeated_tool_calls" in r]),
               mean([r.get("wall_seconds", 0) for r in runs])]
     return "| " + " | ".join(cells) + " |"
 

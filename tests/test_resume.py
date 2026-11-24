@@ -23,7 +23,7 @@ def cli(tmp_path):
     def start(server: FakeOpenAI, *args: str) -> subprocess.Popen:
         servers.append(server)
         env = {**os.environ, "LLM_BASE_URL": server.url, "LLM_API_KEY": "test", "LLM_MODEL": "fake-model",
-               "AGENT_RUNS_DIR": str(runs), "AGENT_MODE": "lazy", "PYTHONUNBUFFERED": "1"}
+               "AGENT_RUNS_DIR": str(runs), "PYTHONUNBUFFERED": "1", "AGENT_MODE": os.environ.get("AGENT_MODE", "lazy")}
         return subprocess.Popen([sys.executable, AGENT, *args], cwd=workdir, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, start_new_session=True)
 
