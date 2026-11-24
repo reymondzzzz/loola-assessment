@@ -3,20 +3,23 @@ from dataclasses import dataclass, field
 from typing import Literal, TypedDict
 
 import openai
-from langgraph.checkpoint.memory import InMemorySaver
+import sqlite3
+from dataclasses import asdict
+
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from harness.config import HarnessConfig
 from harness.context import Candidate, ContextManager, build_prompt
 from harness.protocol import protocol_errors
-from harness.executor import ToolExecutor, failure
+from harness.executor import ToolExecutor, ToolOutcome, failure, outcome_unknown, repeat_is_safe
 from harness.llm import ContextOverflow, LLMClient
 from harness.memory import MEMORY_TOOL_SCHEMAS, read_artifact, search_history
 from harness.metrics import MetricsCollector
 from harness.output import OutputProcessor, fingerprint
 from harness.prompt import initial_tools, system_prompt
 from harness.registry import SKILLS, TOOLS, spec_tool
-from harness.store import ArtifactStore, EventStore, new_run_dir
+from harness.store import ArtifactStore, EventStore, new_run_id, run_dir_for
 from harness.tokens import count_messages
 
 DISCOVERY_TOOLS = {"discover", "describe", "load_skill", "read_skill_resource"}
@@ -41,10 +44,12 @@ class AgentState(TypedDict):
     overflow_attempts: int
     response: dict
     executor: dict
+    metrics: dict
 
 
 @dataclass
 class Run:
+    run_id: str
     config: HarnessConfig
     events: EventStore
     artifacts: ArtifactStore
@@ -100,7 +105,7 @@ def mark_stale(observations: dict, turn: int, environment_changed: bool) -> dict
     return observations
 
 
-def build_graph(run: Run):
+def build_graph(run: Run, checkpointer):
     processor = OutputProcessor(run.config, run.artifacts)
 
     def context_window_manager(state: AgentState) -> ContextManager:
@@ -188,14 +193,31 @@ def build_graph(run: Run):
         executor = ToolExecutor(available={tool["function"]["name"] for tool in state["active_tools"]},
                                 loop_limit=run.config.loop_limit, extra_tools=memory_tools, **state["executor"])
         results = []
+        journal = {}
+        for event in run.events.read():
+            if event["kind"] in ("tool_started", "tool_finished"):
+                journal.setdefault(event["tool_call_id"], {})[event["kind"]] = event
         for action in state["pending_actions"]:
+            recorded = journal.get(action["id"], {})
+            if "tool_finished" in recorded:
+                results.append({**action, **recorded["tool_finished"]["outcome"]})
+                run.metrics.count("tool_results_replayed")
+                continue
+            if "tool_started" in recorded and not repeat_is_safe(action["name"], action["parsed_arguments"]):
+                outcome = outcome_unknown()
+                run.events.append("tool_finished", tool_call_id=action["id"], outcome=vars(outcome))
+                results.append({**action, **vars(outcome)})
+                run.metrics.count("tool_calls_outcome_unknown")
+                continue
             if run.metrics.counters["tool_calls"] >= run.config.max_tool_calls:
                 outcome = failure("BUDGET_EXHAUSTED", "The tool-call budget of this run is exhausted; this call was "
                                   "not executed.", model_can_repair=False)
                 results.append({**action, **vars(outcome)})
                 run.metrics.count("tool_calls_refused")
                 continue
+            run.events.append("tool_started", tool_call_id=action["id"], name=action["name"], arguments=action["arguments"])
             outcome = executor.execute(action["name"], action["arguments"])
+            run.events.append("tool_finished", tool_call_id=action["id"], outcome=vars(outcome))
             run.metrics.count("tool_calls")
             run.metrics.count(f"tool_code_{outcome.code}")
             if action["name"] in DISCOVERY_TOOLS:
@@ -259,12 +281,15 @@ def build_graph(run: Run):
         print("✅ Agent finished" if not errors else f"❌ Protocol errors: {errors}")
         return {"active_messages": messages, "status": "finished" if not errors else "protocol_error"}
 
+    def with_metrics(node):
+        return lambda state: {**node(state), "metrics": run.metrics.export()}
+
     graph = StateGraph(AgentState)
     for name, node in [("context_manager", context_manager), ("prompt_builder", prompt_builder), ("llm", llm),
                        ("tool_router", tool_router), ("tool_executor", tool_executor),
                        ("output_processor", output_processor), ("state_update", state_update),
                        ("final_verification", final_verification), ("emergency", emergency)]:
-        graph.add_node(name, node)
+        graph.add_node(name, with_metrics(node))
     graph.add_edge(START, "context_manager")
     graph.add_conditional_edges("context_manager", route_after_context)
     graph.add_conditional_edges("emergency", route_after_emergency)
@@ -275,27 +300,58 @@ def build_graph(run: Run):
     graph.add_edge("output_processor", "state_update")
     graph.add_conditional_edges("state_update", route_after_update)
     graph.add_edge("final_verification", END)
-    return graph.compile(checkpointer=InMemorySaver())
+    return graph.compile(checkpointer=checkpointer)
 
 
 def initial_state(task: str, config: HarnessConfig) -> AgentState:
     return AgentState(task=task, active_messages=[], summary={}, observations={}, active_skills={},
                       active_tools=initial_tools(config), completed_actions=[], pending_actions=[],
                       context_epoch=0, status="running", turn=0, request=[], request_tokens=0, calibration=1.0,
-                      overflow_attempts=0, response={},
+                      overflow_attempts=0, response={}, metrics={},
                       executor={"environment_version": 0, "failures": {}})
 
 
-def run_agent(task: str, config: HarnessConfig, llm: LLMClient | None = None) -> dict:
-    run_dir = new_run_dir()
-    run = Run(config=config, events=EventStore(run_dir), artifacts=ArtifactStore(run_dir))
+def open_run(run_id: str, config: HarnessConfig, llm: LLMClient | None, metrics: dict | None = None) -> tuple[Run, SqliteSaver]:
+    run_dir = run_dir_for(run_id)
+    run = Run(run_id=run_id, config=config, events=EventStore(run_dir), artifacts=ArtifactStore(run_dir),
+              metrics=MetricsCollector(metrics))
     run.llm = llm or LLMClient(run.metrics, config.llm_retries, config.llm_deadline_seconds)
     run.llm.metrics = run.metrics
-    run.events.append("task", task=task)
-    state = build_graph(run).invoke(initial_state(task, config),
-                                    {"recursion_limit": 8 * config.max_turns + 20, "configurable": {"thread_id": "run"}})
-    metrics = {"stop_reason": state["status"], "turns": state["turn"], "context_epochs": state["context_epoch"],
-               **run.metrics.snapshot(),
-               "events_path": str(run.events.path)}
+    checkpointer = SqliteSaver(sqlite3.connect(run_dir / "checkpoints.sqlite", check_same_thread=False))
+    return run, checkpointer
+
+
+def graph_config(run: Run) -> dict:
+    return {"recursion_limit": 8 * run.config.max_turns + 20, "configurable": {"thread_id": run.run_id}}
+
+
+def execute(run: Run, graph, graph_input) -> dict:
+    state = graph.invoke(graph_input, graph_config(run), durability="sync")
+    metrics = {"run_id": run.run_id, "stop_reason": state["status"], "turns": state["turn"],
+               "context_epochs": state["context_epoch"], **run.metrics.snapshot(), "events_path": str(run.events.path)}
     print(f"\n📊 {json.dumps(metrics)}")
     return metrics
+
+
+def run_agent(task: str, config: HarnessConfig, llm: LLMClient | None = None) -> dict:
+    run_id = new_run_id()
+    run, checkpointer = open_run(run_id, config, llm)
+    (run.events.path.parent / "config.json").write_text(json.dumps(asdict(config)))
+    print(f"🆔 Run {run_id} (resume with: agent.py --resume {run_id})", flush=True)
+    run.events.append("task", task=task)
+    return execute(run, build_graph(run, checkpointer), initial_state(task, config))
+
+
+def resume_agent(run_id: str, llm: LLMClient | None = None) -> dict:
+    run_dir = run_dir_for(run_id)
+    if not (run_dir / "config.json").exists():
+        raise FileNotFoundError(f"no run {run_id} in {run_dir.parent}")
+    config = HarnessConfig(**json.loads((run_dir / "config.json").read_text()))
+    run, checkpointer = open_run(run_id, config, llm)
+    graph = build_graph(run, checkpointer)
+    snapshot = graph.get_state(graph_config(run))
+    run.metrics = MetricsCollector(snapshot.values.get("metrics"))
+    run.llm.metrics = run.metrics
+    run.events.append("resume", pending_nodes=list(snapshot.next))
+    print(f"🆔 Resuming run {run_id} at {list(snapshot.next) or 'end'}", flush=True)
+    return execute(run, build_graph(run, checkpointer), None)

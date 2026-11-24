@@ -2,9 +2,13 @@ from collections import Counter
 
 
 class MetricsCollector:
-    def __init__(self):
-        self.counters: Counter = Counter()
-        self.peak_context = 0
+    def __init__(self, exported: dict | None = None):
+        exported = exported or {}
+        self.counters: Counter = Counter(exported.get("counters", {}))
+        self.peak_context = exported.get("peak_context", 0)
+
+    def export(self) -> dict:
+        return {"counters": dict(self.counters), "peak_context": self.peak_context}
 
     def record_llm_call(self, usage: dict, purpose: str = "agent") -> None:
         prefix = "" if purpose == "agent" else f"{purpose}_"

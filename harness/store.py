@@ -28,8 +28,18 @@ def private_root() -> Path:
     return RUNS_ROOT
 
 
+def new_run_id() -> str:
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+
+def run_dir_for(run_id: str) -> Path:
+    if not run_id.replace("-", "").isalnum():
+        raise ValueError(f"invalid run id {run_id!r}")
+    return private_root() / run_id
+
+
 def new_run_dir() -> Path:
-    return private_root() / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    return run_dir_for(new_run_id())
 
 
 class ArtifactStore:

@@ -117,6 +117,23 @@ def run_catalog_tool(spec: ToolSpec, arguments: dict) -> ToolOutcome:
     raise AssertionError("unreachable")
 
 
+def repeat_is_safe(name: str, arguments: dict) -> bool:
+    if name in META_HANDLERS or name in ("read_artifact", "search_history"):
+        return True
+    if name == "invoke":
+        name = arguments.get("name") if isinstance(arguments.get("name"), str) else ""
+    spec = TOOLS.specs.get(name)
+    return spec is not None and spec.read_only and spec.idempotent
+
+
+def outcome_unknown() -> ToolOutcome:
+    outcome = failure("OUTCOME_UNKNOWN", "The harness process stopped while this call was running, so it is unknown "
+                      "whether it completed. It was not repeated automatically. Inspect the current state (files, "
+                      "processes) before deciding whether to run it again.")
+    outcome.changed_environment = True
+    return outcome
+
+
 @dataclass
 class ToolExecutor:
     available: set[str]

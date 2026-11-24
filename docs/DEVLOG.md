@@ -325,3 +325,25 @@ All five findings were confirmed against the code before fixing; each fix has a 
   metadata, skill tools present/absent, tool part unchanged); `artifact_offloading` toggled alone on the
   masking preset through the full graph — on: every referenced artifact exists and compaction ran; off: no
   artifact files, no artifact references anywhere, outputs still bounded, run finishes within budget.
+
+## 21. 3/5: persistent checkpoints and resume (§4)
+- `SqliteSaver` (package `langgraph-checkpoint-sqlite`) writes graph checkpoints to
+  `<run dir>/checkpoints.sqlite`; `invoke(..., durability="sync")` persists after every step, so a
+  SIGKILL loses at most the step in progress. The run id (`YYYYmmdd-HHMMSS-xxxxxx`) is the run directory name
+  and the LangGraph `thread_id`; it is printed first (`🆔 Run …`). The run's config is saved as
+  `config.json`, metrics live in graph state (`AgentState.metrics`) so they continue across processes.
+- `agent.py --resume RUN_ID` (→ `resume_agent`) reopens the same checkpoint store, event log and artifact
+  store and continues from the next pending node.
+- Uncertain side effects: the executor journals `tool_started` before and `tool_finished` (with the full
+  outcome) after every call. When `tool_executor` re-runs on resume, a finished call is replayed from the
+  journal (never executed twice); a started-but-unfinished call is re-executed only if it is safe to repeat
+  (meta/memory tools, read-only idempotent catalog tools); otherwise it returns `OUTCOME_UNKNOWN`
+  ("not repeated automatically; inspect state first"). LLM calls are simply re-issued.
+- Tests (`tests/test_resume.py`) run the real CLI in subprocesses against a local OpenAI-compatible fake
+  server (`tests/fake_openai.py`, real HTTP through ChatOpenAI, no test hooks in the harness):
+  1. SIGKILL while a bash command (`echo once >> side.log; sleep …`) runs → `--resume` in a new process
+     finishes; the model receives `OUTCOME_UNKNOWN`; `side.log` has exactly one line; same run directory
+     (one `task` event, one `resume` event).
+  2. SIGKILL while waiting for the LLM after a tool finished → resume does not re-run the tool, metrics
+     carry over (`tool_calls == 1`), run finishes.
+  3. Unknown run id → clean error.
