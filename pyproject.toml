@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "langchain-openai>=1.8.5",
     "langgraph>=1.2.24",
+    "tiktoken>=0.14.0",
 ]
 
 [dependency-groups]

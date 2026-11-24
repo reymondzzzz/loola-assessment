@@ -10,12 +10,16 @@ from harness.config import HarnessConfig
 from harness.protocol import protocol_errors
 from harness.executor import ToolExecutor, ToolOutcome
 from harness.llm import ContextOverflow, LLMClient
+from harness.memory import MEMORY_TOOL_SCHEMAS, read_artifact, search_history
 from harness.metrics import MetricsCollector
+from harness.output import OutputProcessor, fingerprint
 from harness.prompt import initial_tools, system_prompt
 from harness.registry import SKILLS, TOOLS, spec_tool
-from harness.store import EventStore, new_run_dir
+from harness.store import ArtifactStore, EventStore, new_run_dir
+from harness.tokens import count_messages
 
 DISCOVERY_TOOLS = {"discover", "describe", "load_skill", "read_skill_resource"}
+RECOVERY_TOOLS = {"read_artifact", "search_history"}
 
 
 class AgentState(TypedDict):
@@ -32,6 +36,7 @@ class AgentState(TypedDict):
     status: str
     turn: int
     request: list[dict]
+    request_tokens: int
     response: dict
     executor: dict
 
@@ -40,6 +45,7 @@ class AgentState(TypedDict):
 class Run:
     config: HarnessConfig
     events: EventStore
+    artifacts: ArtifactStore
     metrics: MetricsCollector = field(default_factory=MetricsCollector)
     llm: LLMClient | None = None
     started: float = field(default_factory=time.monotonic)
@@ -77,12 +83,27 @@ def budget_status(state: AgentState, run: Run) -> str | None:
     return None
 
 
+def mark_stale(observations: dict, turn: int, environment_changed: bool) -> dict:
+    for observation in observations.values():
+        if observation["stale"] or observation["created_at_turn"] == turn:
+            continue
+        path = observation["resource_path"]
+        if path and observation["kind"] == "read" and fingerprint(path) != observation["resource_version"]:
+            observation["stale"] = True
+        if observation["kind"] == "test" and environment_changed:
+            observation["stale"] = True
+    return observations
+
+
 def build_graph(run: Run):
+    processor = OutputProcessor(run.config, run.artifacts)
+
     def context_manager(state: AgentState) -> dict:
         return {}
 
     def prompt_builder(state: AgentState) -> dict:
-        return {"request": build_request(state, run.config)}
+        request = build_request(state, run.config)
+        return {"request": request, "request_tokens": count_messages(request, state["active_tools"])}
 
     def llm(state: AgentState) -> dict:
         turn = state["turn"] + 1
@@ -107,13 +128,18 @@ def build_graph(run: Run):
         return "tool_router" if state["response"]["tool_calls"] else "final_verification"
 
     def tool_router(state: AgentState) -> dict:
-        pending = [{"id": call["id"], "name": call["function"]["name"], "arguments": call["function"]["arguments"]}
+        pending = [{"id": call["id"], "name": call["function"]["name"], "arguments": call["function"]["arguments"],
+                    "parsed_arguments": parsed_arguments(call["function"]["arguments"])}
                    for call in state["response"]["tool_calls"]]
         return {"pending_actions": pending}
 
     def tool_executor(state: AgentState) -> dict:
+        memory_tools = {"read_artifact": (MEMORY_TOOL_SCHEMAS["read_artifact"],
+                                          lambda **a: read_artifact(run.artifacts, **a)),
+                        "search_history": (MEMORY_TOOL_SCHEMAS["search_history"],
+                                           lambda **a: search_history(run.events, run.artifacts, **a))}
         executor = ToolExecutor(available={tool["function"]["name"] for tool in state["active_tools"]},
-                                loop_limit=run.config.loop_limit, **state["executor"])
+                                loop_limit=run.config.loop_limit, extra_tools=memory_tools, **state["executor"])
         results = []
         for action in state["pending_actions"]:
             outcome = executor.execute(action["name"], action["arguments"])
@@ -121,6 +147,8 @@ def build_graph(run: Run):
             run.metrics.count(f"tool_code_{outcome.code}")
             if action["name"] in DISCOVERY_TOOLS:
                 run.metrics.count("discovery_calls")
+            if action["name"] in RECOVERY_TOOLS:
+                run.metrics.count("artifact_retrieval_calls")
             print(f"🔧 Tool: {action['name']}({action['arguments'][:300]})\n   → {outcome.content[:500]}"
                   f"{'...' if len(outcome.content) > 500 else ''}")
             results.append({**action, **vars(outcome)})
@@ -128,7 +156,15 @@ def build_graph(run: Run):
         return {"pending_actions": results, "executor": executed_state}
 
     def output_processor(state: AgentState) -> dict:
-        return {"pending_actions": [{**action, "visible": action["content"]} for action in state["pending_actions"]]}
+        available = run.config.input_budget - state["request_tokens"]
+        processed, observations = processor.process(state["pending_actions"], state["observations"], state["turn"], available)
+        for action in processed:
+            observations[action["id"]]["environment_version"] = state["executor"]["environment_version"]
+            saved = observations[action["id"]]["original_tokens"] - observations[action["id"]]["token_count"]
+            if saved > 0:
+                run.metrics.count("output_tokens_saved", saved)
+        return {"pending_actions": processed, "observations": mark_stale(observations, state["turn"],
+                                                                          any(a["changed_environment"] for a in processed))}
 
     def state_update(state: AgentState) -> dict:
         response, actions = state["response"], state["pending_actions"]
@@ -187,12 +223,13 @@ def build_graph(run: Run):
 def initial_state(task: str, config: HarnessConfig) -> AgentState:
     return AgentState(task=task, constraints=[], active_messages=[], summary={}, observations={}, active_skills={},
                       active_tools=initial_tools(mode_name(config)), completed_actions=[], pending_actions=[],
-                      context_epoch=0, status="running", turn=0, request=[], response={},
+                      context_epoch=0, status="running", turn=0, request=[], request_tokens=0, response={},
                       executor={"environment_version": 0, "failures": {}})
 
 
 def run_agent(task: str, config: HarnessConfig, llm: LLMClient | None = None) -> dict:
-    run = Run(config=config, events=EventStore(new_run_dir()))
+    run_dir = new_run_dir()
+    run = Run(config=config, events=EventStore(run_dir), artifacts=ArtifactStore(run_dir))
     run.llm = llm or LLMClient(run.metrics, config.llm_retries, config.llm_deadline_seconds)
     run.events.append("task", task=task)
     state = build_graph(run).invoke(initial_state(task, config),

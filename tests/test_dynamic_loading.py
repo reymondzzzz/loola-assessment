@@ -57,8 +57,9 @@ def test_skill_progressive_loading():
 
 def test_modes_share_one_catalog():
     eager, lazy = initial_tools("eager"), initial_tools("lazy")
-    assert set(names(eager)) == {"bash", *registry.TOOLS.specs}
-    assert names(lazy) == ["bash", "discover", "describe", "invoke", "load_skill", "read_skill_resource"]
+    assert set(names(eager)) == {"bash", "read_artifact", "search_history", *registry.TOOLS.specs}
+    assert names(lazy) == ["bash", "discover", "describe", "invoke", "load_skill", "read_skill_resource",
+                           "read_artifact", "search_history"]
     assert "invoke" not in names(initial_tools("native"))
     assert not any(f"{name}" in system_prompt("lazy") for name in ("sqlite_query", "git_show", "slack_post_message"))
     assert all(f"# " in system_prompt("eager") for _ in registry.SKILLS.skills)

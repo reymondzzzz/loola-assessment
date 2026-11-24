@@ -141,3 +141,29 @@ reasons, not the full trajectory. Newest entries at the bottom.
 - Tests (mock LLM replaying scripted replies): protocol integrity, error recovery, permission, loop
   detection and reset, non-idempotent retry protection, bash timeout side effects, LLM retry/give-up,
   budget exhaustion.
+- Real smoke run of the new graph (lazy, seed 0, 100k window): 11/11 tickets, 37 turns, 434,755 input
+  tokens (93% cached), peak 27,729, 36 tool calls (5 discovery), no protocol errors.
+
+## 11. Part 3 — output processing and external memory
+- Token counting with tiktoken `o200k_base` (already a transitive dependency of langchain-openai; now
+  declared). Counts include tool schemas and tool-call arguments.
+- `ArtifactStore`: content-addressed files (`a` + sha256[:11]) in the run directory; the full output is
+  saved before anything is truncated, so every shortened observation stays recoverable.
+- `OutputProcessor` pipeline per tool result (flags: output_truncation, deduplication):
+  1. tool-specific filter: pytest → failures, `E` lines, locations, summary; git/bash diffs → headers and
+     changed lines;
+  2. deduplication against observations that are still visible; a duplicate becomes a pointer to the
+     earlier tool call. Bug found by test: pointers were chained (c3 → c2 → c1); only observations whose own
+     content is visible are dedup targets now;
+  3. head/tail truncation (30% head / 70% tail) with an artifact reference whose size is counted in the
+     budget;
+  4. adaptive budget: per-turn budget = min(sum of per-tool `max_output_tokens`, 20% of free input budget),
+     shared equally by the tool calls of that turn.
+  Structured errors are never truncated or deduplicated.
+- Observation metadata per tool result (artifact id, tokens before/after, turn, resource path + file
+  fingerprint, kind, pinned, stale, digest) feeds the context manager. Staleness is tracked after each turn
+  but not acted on until the next compaction epoch: a read becomes stale when the file fingerprint changes;
+  a test result becomes stale when anything changed the environment after it.
+- New base tools in every harness mode: `read_artifact(id, offset, limit)` (paged, max 400 lines) and
+  `search_history(query, limit)` (BM25 over the JSONL event log). Recovered content is appended as a new
+  observation; history is never rewritten to restore it.

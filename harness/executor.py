@@ -1,6 +1,7 @@
 import hashlib, json, os, random, re, signal, sqlite3, subprocess, tempfile, time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
+from typing import Callable
 
 from harness.catalog import ToolSpec
 from harness.registry import BASH_TOOL, META_HANDLERS, META_TOOL_SCHEMAS, TOOLS, validation_error
@@ -96,6 +97,7 @@ class ToolExecutor:
     loop_limit: int = 3
     environment_version: int = 0
     failures: dict[str, int] = field(default_factory=dict)
+    extra_tools: dict[str, tuple[dict, Callable[..., str]]] = field(default_factory=dict)
 
     def call_key(self, name: str, arguments: dict) -> str:
         normalized = json.dumps(arguments, sort_keys=True)
@@ -133,6 +135,11 @@ class ToolExecutor:
             if target not in TOOLS.specs:
                 return failure("UNKNOWN_TOOL", f"Unknown catalog tool '{target}'. Use discover(query).")
             return run_catalog_tool(TOOLS.specs[target], arguments.get("arguments") or {})
+        if name in self.extra_tools:
+            schema, handler = self.extra_tools[name]
+            if (problem := validation_error(arguments, schema["function"]["parameters"])) is not None:
+                return failure("INVALID_ARGUMENTS", problem)
+            return ToolOutcome(True, handler(**arguments))
         if name in META_HANDLERS:
             if (problem := validation_error(arguments, META_TOOL_SCHEMAS[name]["function"]["parameters"])) is not None:
                 return failure("INVALID_ARGUMENTS", problem)
