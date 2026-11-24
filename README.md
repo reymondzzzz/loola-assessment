@@ -219,7 +219,7 @@ all three modes on the same code revision `dfe7a3c`, same seeds):
 What the numbers show (and do not show):
 
 - **Quality**: every run in every mode closed all 11 tickets, including the recall ticket (a code name stated
-  once in ticket 1 and needed in ticket 11, after up to 6 compactions at 16k). No quality regression was
+  once in ticket 1 and needed in ticket 11, after up to 8 compactions at 16k). No quality regression was
   observed; with n = 2 that is evidence, not proof.
 - **Dynamic loading**: the clean signal is the fixed per-call cost — eager sends 2,887 tokens of schemas and
   skills on every call vs 576 for lazy. In totals, eager also took more turns (42 vs 31): with 25 granular

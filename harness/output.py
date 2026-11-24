@@ -67,7 +67,8 @@ def minimal_reference(artifact_id: str) -> str:
     return f"[artifact {artifact_id}]"
 
 
-MIN_CALL_BUDGET = count_tokens(minimal_reference("a0123456789a"))
+ARTIFACT_ID_LENGTH = 12
+MIN_CALL_BUDGET = count_tokens(minimal_reference("")) + ARTIFACT_ID_LENGTH
 
 
 def head_tail(text: str, budget: int, artifact_id: str, original_tokens: int) -> str:
@@ -131,6 +132,7 @@ class OutputProcessor:
             digest = hashlib.sha256(content.encode()).hexdigest()
             if action.get("spill_path"):
                 artifact_id = self.artifacts.save_file(action["spill_path"])
+                digest = artifact_id
                 original_tokens = (self.artifacts.directory / f"{artifact_id}.txt").stat().st_size // 4
             else:
                 artifact_id = self.artifacts.save(content)

@@ -96,3 +96,24 @@ def test_pytest_cache_files_do_not_count_as_test_changes(tmp_path):
     (tests_dir / "__pycache__" / "test_pricing.cpython-312-pytest.pyc").write_bytes(b"x")
     shutil.copy(bench_run.VISIBLE_TESTS_DIR / "test_pricing.py", tests_dir / "test_pricing.py")
     assert bench_run.tests_intact(tmp_path, current_ticket=0)
+
+
+def test_large_outputs_with_equal_preview_are_not_deduplicated(tmp_path):
+    script = f"{sys.executable} -c \"print('H' * 300_000); print('{{middle}}'); print('T' * 300_000)\""
+    first, second = run_bash(script.format(middle="one")), run_bash(script.format(middle="two"))
+    assert first.content == second.content
+    processor = OutputProcessor(HarnessConfig(**OUTPUT_PIPELINE), ArtifactStore(tmp_path))
+    actions = [{"id": f"c{i}", "name": "bash", "arguments": "{}", "parsed_arguments": {}, **vars(o)}
+               for i, o in enumerate((first, second))]
+    _, observations = processor.process(actions[:1], {}, 1, 50_000)
+    processed, observations = processor.process(actions[1:], observations, 2, 50_000)
+    assert not processed[0]["visible"].startswith("[Identical")
+    assert observations["c0"]["artifact_id"] != observations["c1"]["artifact_id"]
+
+
+def test_minimal_reference_fits_floor_for_any_artifact_id():
+    import random
+    from harness.output import MIN_CALL_BUDGET, minimal_reference
+    rng = random.Random(0)
+    ids = ["a" + "".join(rng.choice("0123456789abcdef") for _ in range(11)) for _ in range(2000)]
+    assert max(count_tokens(minimal_reference(i)) for i in ids) <= MIN_CALL_BUDGET

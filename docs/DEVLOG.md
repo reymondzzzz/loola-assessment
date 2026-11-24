@@ -261,7 +261,8 @@ All five findings were confirmed against the code before fixing; each fix has a 
    A multi-epoch graph test needed a longer scenario because outputs are now smaller.
 
 ## 16. Part 5 results
-- Final matrix: 30 real runs, all 11/11 tickets (incl. the recall ticket after up to 6 compactions).
+- Final matrix: 18 real runs (29 recorded in total incl. earlier versions), all 11/11 tickets (incl. the
+  recall ticket after up to 8 compactions).
   Tables and interpretation in README §10. 100k matrix on `fe022a1` (no compaction can trigger there);
   16k compaction trio re-run on `dfe7a3c`, same seeds. Older rows kept with `-pre`/`-part1` labels.
 - Main findings: fixed per-call cost 2,887 (eager) vs 576 (lazy) tokens; the output pipeline cut peak
@@ -272,3 +273,12 @@ All five findings were confirmed against the code before fixing; each fix has a 
 - Privacy pass before publishing: run logs contained the home path and `ls -la` owner name; replaced with
   `<repo>`, `~` and `user`. Three logs committed earlier still contain the path in history; not rewritten,
   because commit author name/email are public anyway and rewriting would change hashes cited in the docs.
+
+## 17. Fixes from the third review
+1. Deduplication compared the bounded preview of large bash outputs: two outputs with equal head and tail
+   but different middles were reported as identical. Spilled outputs now use the full artifact's hash as
+   their digest (`test_large_outputs_with_equal_preview_are_not_deduplicated`).
+2. `MIN_CALL_BUDGET` was measured on one example id (9 tokens); other ids tokenize to 14–15. The floor is now
+   the worst case: reference overhead + one token per id character (checked over 2,000 random ids).
+3. Wrong counts in the docs: the final matrix is 18 runs (29 recorded in total), and the recall ticket
+   survived up to 8 compactions (hybrid-16k seed 0), not 6. Corrected in README and here.
