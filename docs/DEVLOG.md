@@ -429,3 +429,22 @@ All five findings were confirmed against the code before fixing; each fix has a 
   evidence); `.gitattributes` marks `bench/runs/*.log -whitespace`. Code and docs are clean.
 - Checks: 80 tests pass; baseline SHA-256 `d1e005f6…eb1c` matches the provided file; `agent.py` (no task,
   `--help`), `bench/run.py --help` work; no keys or personal data in tracked files; working tree clean.
+
+## 27. Guardrails and a rules-only AGENTS.md
+- `scripts/check.py` is the one gating command: runs `scripts/guardrails.py`, the full test suite, and fails on
+  any failure, any skipped/xfailed test, fewer than `MIN_TESTS` (87, ratchet up only) or a README test count that
+  differs from the real one.
+- Guardrails (`scripts/guardrails.py`), checked over tracked + untracked non-ignored files:
+  G1 baseline files frozen by SHA-256; G2 no API keys, home-directory paths or personal emails; G3 `.env` not
+  tracked; G4 layering (`harness/` never imports bench/tests/baseline/agent; baseline never imports harness);
+  G5 no trailing whitespace in code/docs (recorded run logs exempt).
+- Each guardrail has a regression test on a throwaway git repo with exactly one violation and an exact-message
+  assertion; each test was shown to bite by disabling its rule (only that test failed). The gate's own checks
+  were exercised the same way: wrong README count → T4, a skipped probe test → T2, raised minimum → T3.
+- First run caught the guardrail test itself (literal fixture path/email); fixture strings are now assembled
+  from parts.
+- `AGENTS.md` rewritten as rules only (120 lines): the gating command first, G1–G5 and T1–T4 with their gates,
+  harness invariants each pinned to named tests, reviewer-enforced rules (benchmark evidence, no code changes
+  while a benchmark runs, no push without OK), where new code goes, and the doc-update contract. Every named
+  test and path was checked to exist. `CLAUDE.md` is a single `@AGENTS.md` line.
+- Not done: blind-agent trials of the rules (skill step 7, second half).

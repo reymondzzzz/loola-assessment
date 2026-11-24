@@ -362,7 +362,7 @@ uv run --env-file .env python agent.py --resume <id>                            
 uv run --env-file .env python agent.py --resume <id> --message "new requirement" # late requirement change
 uv run --env-file .env python agent.py --verify "python -m pytest -q" "<task>"   # must pass before done
 
-uv run python -m pytest -q tests                                                # 80 deterministic tests
+uv run python -m pytest -q tests                                                # 87 deterministic tests
 uv run --env-file .env python bench/run.py --label hybrid --mode hybrid --runs 2 \
   [--context-window 16000] [--eviction-policy default|fifo|size]
 uv run --env-file .env python bench/run.py --label original --mode original --runs 2   # provided file
