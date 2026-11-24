@@ -4,7 +4,8 @@ A LangGraph coding-agent harness grown from the provided single-file loop. It ad
 loading**, **adaptive context compaction**, external artifact memory, a structured error taxonomy, and a
 reproducible benchmark that measures tokens, cache hits and task success against the original loop.
 
-- Original code, unchanged: [`baseline/original_agent.py`](baseline/original_agent.py)
+- Original code, byte-identical to the provided file (SHA-256 pinned in a test):
+  [`baseline/original_agent.py`](baseline/original_agent.py)
 - Decisions, commands, results and trade-offs: [`docs/DEVLOG.md`](docs/DEVLOG.md) (the session log)
 - Agent instructions for this repo: [`AGENTS.md`](AGENTS.md)
 
@@ -27,7 +28,7 @@ START → context_manager → prompt_builder → llm ─┬─ no tool calls →
 
 | Component | File | Responsibility |
 |---|---|---|
-| AgentState, graph wiring | `harness/graph.py` | orchestration only; InMemorySaver checkpoints |
+| AgentState, graph wiring | `harness/graph.py` | orchestration only; SqliteSaver checkpoints per run, resume |
 | HarnessConfig, mode presets | `harness/config.py` | flags, budgets, limits |
 | ToolRegistry, SkillRegistry | `harness/registry.py`, `harness/catalog.py` | catalog, BM25 discovery, validation |
 | PromptBuilder | `harness/prompt.py`, `harness/context.py:build_prompt` | stable system prompt, base tools, prompt layout |
@@ -41,8 +42,18 @@ START → context_manager → prompt_builder → llm ─┬─ no tool calls →
 | BenchmarkRunner | `bench/` | ticket-queue task, independent checker, report |
 
 State is split three ways: the immutable history (JSONL event log + artifacts on disk, outside the prompt),
-the active LLM context (`active_messages`, `summary`), and structured execution state (`observations`,
-`active_skills`, `active_tools`, `completed_actions`, executor counters).
+the active LLM context (`active_messages`, `summary`, pinned `requirements`), and structured execution state
+(`observations`, `active_skills`, `active_tools`, `completed_actions`, executor counters, `metrics`).
+
+**Persistence and resume.** Every run has a stable id (`YYYYmmdd-HHMMSS-xxxxxx`), printed first, which names
+its directory (`config.json`, `events.jsonl`, `artifacts/`, `checkpoints.sqlite`) and is the LangGraph
+`thread_id`. Checkpoints are written synchronously after every step (`SqliteSaver`, `durability="sync"`).
+`agent.py --resume RUN_ID` continues a stopped, finished or crashed run in a new process with the same log
+and artifacts. The executor journals `tool_started`/`tool_finished`: on resume a finished call is replayed
+from the journal, and a call interrupted mid-flight is re-run only if it is read-only and idempotent;
+otherwise the model gets `OUTCOME_UNKNOWN` and is told to inspect state. `--message "…"` adds a **late user
+requirement**: it is stored in state and rendered as a `user` message right after the task, pinned like the
+task (compaction validation rejects any change to it; the summarizer receives it verbatim).
 
 ## 3. Dynamic tools and skills
 
@@ -51,12 +62,16 @@ external-service tools with realistic schemas and no backend (labelled; calling 
 `NOT_AVAILABLE` or `PERMISSION_DENIED`). Each `ToolSpec` carries keywords, read_only, idempotent, timeout,
 version and max_output_tokens.
 
-| Mode | `tools[]` | System prompt | Fixed cost per call (measured) |
-|---|---|---|---|
-| original | bash | original | 171 tokens |
-| eager | bash + 25 schemas (+ memory tools) | + all SKILL.md bodies | 2,887 tokens |
-| lazy — static dispatcher (default) | bash, discover, describe, invoke, load_skill, read_skill_resource, read_artifact, search_history | one-line catalog hint + skill L0 metadata | 576 tokens |
-| native (experiment) | lazy minus invoke; `describe(x)` appends x's schema | same as lazy | 535 tokens before binding |
+The prompt and base tools are derived from three independent flags (`harness/prompt.py`):
+
+| Flag | True | False |
+|---|---|---|
+| `lazy_tools` | bash + `discover`, `describe`, `invoke`; one-line catalog hint | bash + all 25 schemas in `tools[]` |
+| `lazy_skills` | skill L0 metadata in the prompt + `load_skill`, `read_skill_resource` | all SKILL.md bodies in the prompt, no skill tools |
+| `artifact_offloading` | outputs archived, `read_artifact` tool, references in truncated/masked output | nothing archived, no `read_artifact`, truncation says "Output not archived" |
+
+`search_history` is always present. Fixed per-call cost measured with a real request (part-1 code): original
+171 tokens, eager 2,887, lazy 576, native 535 before any binding.
 
 - **Static dispatcher**: `discover(query, kind="tool"|"skill")` (BM25 over names, descriptions, keywords) →
   `describe(name)` → `invoke(name, arguments)`. The executor validates arguments against the schema and
@@ -97,9 +112,11 @@ budget of min(per-tool limits, 20% of free input budget) shared by all calls of 
 
 ## 5. Eviction policies
 
-Policy (what) is separate from mechanism (how). Default policy: candidates are unpinned, recoverable
-(archived), outside the last `recent_interactions` (5) interactions and ≥ 64 tokens; ordered stale first,
-then largest, then oldest. With `cache_aware`, ties within a 256-token size bucket go to the **later**
+Policy (what) is separate from mechanism (how). Every policy first applies the same guards: candidates are
+unpinned, recoverable (artifact available), outside the last `recent_interactions` (5) interactions and
+≥ 64 tokens. `HarnessConfig.eviction_policy` (or `AGENT_EVICTION_POLICY`, `bench/run.py --eviction-policy`)
+then orders them: `default` — stale first, then largest, then oldest; `fifo` — oldest first; `size` —
+largest first. With `cache_aware`, ties within a 256-token size bucket go to the **later**
 message, because modifying a later message preserves a longer cached prefix. Pinned: the original task (fixed
 slot, never summarized) and loaded skill instructions. Version-aware staleness uses file fingerprints
 (mtime + size); unrestricted bash conservatively invalidates earlier test results.
@@ -110,7 +127,9 @@ Full tool outputs and large archived arguments are content-addressed files; the 
 assistant message, tool call and result, compaction report and summary. The model recovers anything with
 `read_artifact(id, offset, limit)` (paged, ≤ 400 lines) or `search_history(query)` (BM25 over the log).
 Recovered content is appended as a new observation, never restored in place, so the prefix survives until
-the next compaction. LangGraph checkpoints persist graph state; they are unrelated to the KV cache.
+the next compaction. With `artifact_offloading=False` no artifacts exist, so those observations count as
+unrecoverable and are never masked behind a reference. LangGraph checkpoints (§2) persist graph state across
+processes; they are unrelated to the provider's KV cache.
 
 ## 7. Prompt cache — answer to question 1
 
@@ -149,7 +168,8 @@ Handle in the harness, deterministically:
   jitter and a deadline; transient failures of read-only idempotent tools → 2 retries; context overflow →
   compaction / emergency path; oversized output → truncation + artifact;
 - **never auto-retried**: bash and non-idempotent tools (a timeout does not prove nothing happened; the
-  process group is killed and the model is told to inspect state first);
+  process group is killed and the model is told to inspect state first); after a crash, an interrupted
+  side-effecting call returns `OUTCOME_UNKNOWN` on resume instead of running again;
 - **non-recoverable**: auth errors stop the run; `PERMISSION_DENIED` (side-effecting external tools, a small
   bash denylist) is reported with `model_can_repair: false`; exhausted budgets (turns, tool calls, tokens,
   wall time) stop with an explicit status; `LOOP_DETECTED` replaces the third identical failing call made
@@ -170,23 +190,36 @@ edge-case tests, reference implementations), and `tests/`, `data/`, `logs/` are 
 The checker was validated before use: a reference solution scores 11/11 on seeds 0–2 and naive solutions are
 rejected. The agent's final message is never used as evidence.
 
-Modes (`harness/config.py`): eager and lazy share the catalog; masking, summary and hybrid share the output
-processor, artifact store, model and environment and differ only in context strategies.
+Modes (`harness/config.py` presets; each flag can also be toggled alone, see `tests/test_flags.py`): eager
+and lazy share the catalog; masking, summary and hybrid share the output processor, artifact store, model and
+environment and differ only in context strategies.
 
-| Mode | Lazy loading | Output pipeline | Masking/stale/pruning | Summary |
-|---|---|---|---|---|
-| original | — | — | — | — |
-| eager | no | no | no | no |
-| lazy | yes | no | no | no |
-| masking | yes | yes | yes | no |
-| summary | yes | yes | no | yes |
-| hybrid | yes | yes | yes | yes |
+| Mode | lazy_tools | lazy_skills | output pipeline (truncation, offloading, dedup) | masking/stale/pruning | summary |
+|---|---|---|---|---|---|
+| original | — (provided file) | — | — | — | — |
+| eager | no | no | no | no | no |
+| lazy | yes | yes | no | no | no |
+| masking | yes | yes | yes | yes | no |
+| summary | yes | yes | yes | no | yes |
+| hybrid | yes | yes | yes | yes | yes |
 
-Model: `gpt-6-luna` via the OpenAI API. Main matrix at a 100k context window. Compaction does not trigger
-there (runs peak below 30k), so the compaction modes were also run with an **artificially reduced 16k
-window** (16k), labelled `-16k`. `original` runs the behaviour-preserving LangGraph port of the provided loop,
-because the provided file sends `temperature`, which this model rejects (verified equivalent by replaying
-scripted replies through both).
+`original` runs `baseline/original_agent.py` unmodified (`bench/run.py --mode original`): endpoint, model and
+key are injected as module attributes, usage is recorded by wrapping `requests.post` (which also adds a 600 s
+timeout), and `MAX_TURNS` is set to the same limit as every mode. `original-port` is the
+behaviour-preserving LangGraph port, used where the provided payload is rejected.
+
+Metrics per run include `repeated_tool_calls`: tool calls whose tool name and arguments, normalized to JSON
+with sorted keys and no whitespace, equal an earlier call of the same run. Results record the code revision.
+
+Deterministic checks (no network; scripted LLM or a local OpenAI-compatible fake server driving the real
+CLI) verify mechanisms: resume after SIGKILL, late requirements surviving compaction, flags, eviction
+orders, the original route. Real measurements are the benchmark rows below.
+
+Models: the comparable matrix runs **every mode, including the literal `original`, on `gpt-4.1-mini`**
+(same OpenAI endpoint; it accepts the provided payload with `temperature`). The earlier matrix ran on
+`gpt-6-luna`, which rejects `temperature`, so its baseline is `original-port`. Main matrices use a 100k context
+window; compaction does not trigger there (runs peak below 30k), so the compaction modes also ran with an
+**artificially reduced 16k window**, labelled `-16k`.
 
 ## 10. Results
 
@@ -195,12 +228,14 @@ Means over seeds 0 and 1 (n = 2 per mode). "Input" includes summarizer calls; "u
 reported `cached_tokens` (cached tokens are a subset of input, not added twice). Produce the tables with
 `uv run python bench/report.py <labels…>`.
 
+### gpt-6-luna (earlier matrix; baseline = `original-port`)
+
 **Main matrix, 100k context window** (code at `fe022a1`; `summary` lane started after the summary-role
 change, `hybrid` before it — at 100k neither ever summarized, so it does not matter here):
 
 | mode | success | turns | input tokens | cached | uncached | peak context | compactions | wall s |
 |---|---|---|---|---|---|---|---|---|
-| original | 2/2 | 28 | 432,538 | 93% | 30,948 | 29,002 | 0 | 113 |
+| original-port | 2/2 | 28 | 432,538 | 93% | 30,948 | 29,002 | 0 | 113 |
 | eager | 2/2 | 42 | 511,664 | 96% | 21,437 | 22,890 | 0 | 140 |
 | lazy | 2/2 | 31 | 442,501 | 93% | 32,300 | 30,380 | 0 | 143 |
 | masking | 2/2 | 40 | 342,127 | 95% | 18,112 | 16,170 | 0 | 155 |
@@ -216,7 +251,7 @@ all three modes on the same code revision `dfe7a3c`, same seeds):
 | summary-16k | 2/2 | 51 | 345,268 | 71% | 100,764 | 99,448 | 8,973 | 2 | 365 |
 | hybrid-16k | 2/2 | 69 | 417,870 | 78% | 92,114 | 49,514 | 7,874 | 6 | 346 |
 
-What the numbers show (and do not show):
+What the gpt-6-luna numbers show (and do not show):
 
 - **Quality**: every run in every mode closed all 11 tickets, including the recall ticket (a code name stated
   once in ticket 1 and needed in ticket 11, after up to 8 compactions at 16k). No quality regression was
@@ -244,6 +279,41 @@ What the numbers show (and do not show):
   same ordering: masking cheapest, summary-only most expensive in uncached tokens.
 - Not measured: TTFT (no streaming), monetary cost (model pricing unknown to me).
 
+### gpt-4.1-mini (comparable matrix: every mode incl. the literal `original`, same model and endpoint)
+
+Code revision `896b8ca` for all rows (recorded as `896b8ca-dirty`: during the runs only README.md, AGENTS.md
+and docs/DEVLOG.md were edited, no code). n = 2 per mode, plus a re-run of `original` (n = 2). 100k window
+unless labelled `-16k`.
+
+| mode | success | tickets (mean) | turns | input tokens | cached | uncached | peak context | compactions | repeated calls | wall s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| original (literal file) | 0/2 | 4 | 39 | 191,607 | 88% | 22,647 | 6,867 | 0 | 9 | 104 |
+| original, re-run | 0/2 | 4 | 53 | 411,435 | 91% | 38,699 | 10,068 | 0 | 18 | 159 |
+| eager | **2/2** | 11 | 92 | 1,253,328 | 96% | 44,624 | 24,816 | 0 | 16 | 338 |
+| lazy | 0/2 | 5 | 108 | 1,731,003 | 93% | 115,451 | 26,362 | 0 | 26 | 229 |
+| masking | 0/2 | 5 | 104 | 1,215,648 | 93% | 82,720 | 19,936 | 0 | 23 | 208 |
+| summary | 0/2 | 10 | 100 | 973,718 | 88% | 112,726 | 18,246 | 0 | 20 | 221 |
+| hybrid | 0/2 | 2 | 50 | 289,846 | 83% | 49,718 | 10,338 | 0 | 18 | 97 |
+| masking-16k | 0/2 | 3 | 40 | 166,382 | 77% | 38,766 | 6,626 | 0 | 10 | 84 |
+| summary-16k | 0/2 | 4 | 113 | 567,017 | 71% | 165,481 | 8,117 | 2 | 28 | 295 |
+| hybrid-16k | 0/2 | 7 | 108 | 546,703 | 72% | 150,671 | 7,620 | 3 | 26 | 239 |
+
+What these numbers show:
+
+- **The literal baseline never finished**: all 4 attempts crashed on a transient `SSLError` from the API
+  (turns 14–92, after closing 1–8 tickets). The provided loop has no retries, so one dropped connection ends
+  the run. All harness runs went through the same network window; several needed 1–3 LLM retries
+  (`llm_retries`) and none crashed. Its token numbers are therefore for truncated runs and are not comparable.
+- **gpt-4.1-mini is a much weaker agent on this task**: runs often ended early because the model answered
+  "I will now apply the fixes…" without a tool call (the original stop rule, kept in every mode), or hit the
+  150-turn / token budget. Only `eager` succeeded (2/2). With the full catalog in `tools[]`, this model used
+  granular tools (`edit_file`, `read_file`, `run_tests`) and kept going; in `lazy` it relied on bash.
+- `summary` seed 0 closed all 11 tickets but **failed the independent check**: during the rename ticket it
+  ran `sed -i 's/qty/quantity/g' tests/test_store.py`, modifying a protected test file.
+- Token totals here mostly reflect how long each run survived, not efficiency; the context-strategy
+  hypothesis cannot be judged on this model (quality noise dominates at n = 2). The fixed per-call cost
+  difference (eager vs lazy) and the gpt-6-luna matrix above remain the clean token comparisons.
+
 ## 11. Trade-offs and limitations
 
 - Sample sizes are small (see the `runs` column); turn counts vary by tens of percent between runs of the
@@ -254,7 +324,11 @@ What the numbers show (and do not show):
 - Summaries are validated structurally, not semantically: a summary that drops a fact still passes. Recovery
   then relies on `search_history`/`read_artifact`.
 - Staleness of files read through bash (`cat`) is not tracked; only catalog reads have fingerprints.
-- No late user messages are supported (single-shot task), so "late requirement changes" is untested.
+- Late requirements are added between runs of the process (`--resume … --message`), not injected into a
+  live process; adding one changes the prompt head once (one cache miss). The live check of this scenario is
+  the deterministic CLI test; no benchmark ticket exercises it.
+- `original` adds a request timeout around the provided `requests.post` (instrumentation, not in the file).
+- Checkpoints are local SQLite files; resuming on another machine needs the run directory copied.
 - Tool calls run sequentially; parallel read-only execution was not needed for this task.
 - Cost in dollars is not reported: pricing for the model was not available to me.
 
@@ -270,11 +344,16 @@ independent read-only tools; a cost model for compaction timing (reprefill cost 
 uv sync
 cp .env.example .env            # LLM_BASE_URL, LLM_API_KEY, LLM_MODEL (any OpenAI-compatible endpoint)
 uv run --env-file .env python agent.py "list files in the current directory"     # AGENT_MODE=lazy by default
-AGENT_MODE=hybrid uv run --env-file .env python agent.py "<task>"
+AGENT_MODE=hybrid AGENT_CONTEXT_WINDOW=16000 AGENT_EVICTION_POLICY=fifo \
+  uv run --env-file .env python agent.py "<task>"                                # prints 🆔 Run <id>
+uv run --env-file .env python agent.py --resume <id>                             # continue after a stop/crash
+uv run --env-file .env python agent.py --resume <id> --message "new requirement" # late requirement change
 
-uv run python -m pytest -q tests                                                # 55 deterministic tests
-uv run --env-file .env python bench/run.py --label hybrid --mode hybrid --runs 2 [--context-window 16000]
-uv run python bench/report.py                                                   # results table
+uv run python -m pytest -q tests                                                # 70 deterministic tests
+uv run --env-file .env python bench/run.py --label hybrid --mode hybrid --runs 2 \
+  [--context-window 16000] [--eviction-policy default|fifo|size]
+uv run --env-file .env python bench/run.py --label original --mode original --runs 2   # provided file
+uv run python bench/report.py [labels…]                                         # results table
 ```
 
 Run directories (events, artifacts) go to `$AGENT_RUNS_DIR` or a private (0700) folder in the temp dir.

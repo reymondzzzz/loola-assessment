@@ -388,3 +388,16 @@ All five findings were confirmed against the code before fixing; each fix has a 
 - Results now carry `code_revision` (`git rev-parse --short HEAD`, `-dirty` if uncommitted).
 - Route test against the fake server: `run_once(…, "original")` generates the fixture, runs the provided loop,
   scores independently; the server receives the provided payload; the file hash is unchanged afterwards.
+
+## 24. Comparable live matrix on gpt-4.1-mini
+- All modes, including the literal `original`, on gpt-4.1-mini via the same OpenAI endpoint (it accepts the
+  provided payload); code `896b8ca` (rows say `896b8ca-dirty`: only README/AGENTS/DEVLOG were edited during
+  the runs). 9 modes × 2 seeds + `original` re-run × 2 = 20 runs; table in README §10.
+- Literal `original`: 4/4 attempts crashed on transient `SSLError` (no retries in the provided loop). I
+  stopped re-running after the second pair rather than selecting a lucky run. Harness modes saw 1–3 LLM
+  retries in some runs and never crashed.
+- Success: eager 2/2, every other mode 0/2. Failure causes seen in the logs: early stops (model announces work
+  and ends the turn without a tool call), 150-turn/token budget, and one protected-test edit
+  (`summary` seed 0, `sed -i … tests/test_store.py`) caught by the independent check.
+- Mistake of mine during the wait: the watcher loops used `pgrep -f "bench/run.py"`, which matched their own
+  command line, so they never exited (and looked "stuck"). The runs were fine; the loops were stopped.

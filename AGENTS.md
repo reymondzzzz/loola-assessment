@@ -5,20 +5,23 @@ compaction, artifact memory and a before/after benchmark. Overview and results: 
 their evidence: `docs/DEVLOG.md`.
 
 ## Layout
-- `baseline/` — `original_agent.py` (provided code, byte-identical; never edit) and `langgraph_port.py`
-  (behaviour-preserving port used as benchmark mode `original`; never edit).
+- `baseline/` — `original_agent.py` (provided code, byte-identical, SHA-256 pinned in a test; never edit; the
+  benchmark injects endpoint config at runtime) and `langgraph_port.py` (behaviour-preserving port, benchmark
+  mode `original-port`; never edit).
 - `harness/` — the harness. `graph.py` only orchestrates; logic lives in `registry`/`catalog` (tools,
   skills), `executor` (tool execution, errors), `output` (output pipeline), `context` (compaction),
   `store`/`memory` (artifacts, event log, recovery tools), `llm`, `metrics`, `config` (mode presets).
 - `skills/<name>/SKILL.md` + `references/` — Agent Skills, loaded progressively.
 - `bench/` — ticket-queue benchmark: `generate.py` (project per seed), `tickets.py` (tickets + checks),
   `run.py` (runner + independent scoring), `report.py`, `results.jsonl`, `runs/*.log`.
-- `tests/` — deterministic tests with a scripted LLM (`tests/fakes.py`); no network.
+- `tests/` — deterministic tests: scripted LLM (`tests/fakes.py`) and a local OpenAI-compatible fake server
+  (`tests/fake_openai.py`) that drives the real CLI in subprocesses; no external network.
 
 ## Commands
 - `uv sync`; `cp .env.example .env` and fill an OpenAI-compatible endpoint.
 - Tests: `uv run python -m pytest -q tests` (must stay green).
-- Agent: `AGENT_MODE=lazy uv run --env-file .env python agent.py "<task>"`.
+- Agent: `AGENT_MODE=lazy uv run --env-file .env python agent.py "<task>"`; resume with
+  `agent.py --resume RUN_ID [--message "new requirement"]`.
 - Benchmark: `uv run --env-file .env python bench/run.py --label X --mode hybrid --runs 2 [--context-window N]`,
   then `uv run python bench/report.py`.
 
