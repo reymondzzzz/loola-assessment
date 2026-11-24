@@ -105,3 +105,17 @@ def test_graph_offloads_and_recovers(tmp_path, monkeypatch):
     assert '"tool_call_id": "c1"' in results[1]
     assert "entry 1500 ORCHID" in results[2]
     assert metrics["artifact_retrieval_calls"] == 2 and metrics["output_tokens_saved"] > 10_000
+
+
+def test_run_root_is_private(tmp_path, monkeypatch):
+    import os
+    from harness import store
+    root = tmp_path / "runs"
+    monkeypatch.setattr(store, "RUNS_ROOT", root)
+    store.new_run_dir()
+    assert root.stat().st_mode & 0o777 == 0o700
+    root.chmod(0o755)
+    import pytest
+    with pytest.raises(PermissionError):
+        store.new_run_dir()
+    root.chmod(0o700)

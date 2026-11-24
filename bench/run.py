@@ -75,11 +75,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True)
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--first-seed", type=int, default=0)
     parser.add_argument("--mode", choices=("original", *MODES), default="original")
     parser.add_argument("--context-window", type=int, default=BENCH_CONTEXT_WINDOW)
     args = parser.parse_args()
     langgraph_port.MAX_TURNS = BENCH_MAX_TURNS
-    for seed in range(args.runs):
+    for seed in range(args.first_seed, args.first_seed + args.runs):
         result = run_once(args.label, seed, args.mode, args.context_window)
         with open(RESULTS_FILE, "a") as f:
             f.write(json.dumps(result) + "\n")

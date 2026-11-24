@@ -20,8 +20,16 @@ class EventStore:
         return [json.loads(line) for line in self.path.read_text().splitlines()] if self.path.exists() else []
 
 
+def private_root() -> Path:
+    RUNS_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    status = RUNS_ROOT.stat()
+    if status.st_uid != os.getuid() or status.st_mode & 0o077:
+        raise PermissionError(f"{RUNS_ROOT} must be owned by the current user with mode 0700 (tool outputs may hold secrets)")
+    return RUNS_ROOT
+
+
 def new_run_dir() -> Path:
-    return RUNS_ROOT / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    return private_root() / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
 
 class ArtifactStore:

@@ -167,3 +167,52 @@ reasons, not the full trajectory. Newest entries at the bottom.
 - New base tools in every harness mode: `read_artifact(id, offset, limit)` (paged, max 400 lines) and
   `search_history(query, limit)` (BM25 over the JSONL event log). Recovered content is appended as a new
   observation; history is never rewritten to restore it.
+
+## 12. Part 4 — adaptive context manager
+- Budget: `input_budget = context_window − output_reserve (4096) − safety_margin (2048)`; compaction runs only
+  when the estimated next request (all messages + tool schemas, tiktoken) reaches the high watermark (80%)
+  and compacts down to the low watermark (50%), so it happens rarely and buys many turns. Estimates are
+  calibrated by the last `usage.input_tokens / estimate` ratio (clamped 0.8–1.5).
+- Cascade (`harness/context.py`), cheapest and safest first, stopping as soon as the context is ≤ low:
+  1. stale + duplicate eviction — mask outputs of files that changed since they were read, test results
+     superseded by later changes, and older copies of identical outputs;
+  2. observation masking — replace old tool results with a reference (`tool + args → status, tokens,
+     read_artifact(id)`, error text kept for failures). Message ids, tool_call ids and the assistant tool
+     calls stay untouched;
+  3. interaction pruning — archive large tool-call arguments (heredocs, file contents) to artifacts, then
+     replace whole old groups (assistant message + all its tool results) by one compact list of execution
+     events; never splits a group, never leaves orphan results;
+  4. semantic compaction — one LLM call producing a structured summary (goal, verified facts, decisions,
+     completed/failed/pending work, paths, artifact refs, skill refs). Input: original task verbatim, previous
+     summary (incremental), deterministic execution events, and the history to compress. The summary is
+     validated (keys, types, non-empty goal, size, existing artifact ids) before it is committed;
+  5. emergency — mask everything but the last interaction, archive older messages, truncate oversized
+     results; if the mandatory part still does not fit, stop with `context_budget_exceeded`.
+- Policy vs mechanism: `eviction_candidates` (policy) picks unpinned, recoverable, non-recent observations
+  ≥ 64 tokens, ordered stale first, then by size, then by age; `mask`/pruning are the mechanisms.
+  Cache-aware tie-break (flag `cache_aware`): within the same size bucket (256 tokens) prefer later messages,
+  because masking a later message keeps a longer unchanged prefix.
+- Pinning: the original task is a fixed message slot and never enters the summarizer's output; loaded skill
+  instructions are pinned against masking. Skills track `loaded_at_turn` and `visible_in_context`; when a
+  skill's message is summarized away it is marked not visible and listed in `active_skill_refs`, and
+  `load_skill` simply reloads it.
+- Transactional: strategies work on a deep copy; the result is committed only if protocol validation, task
+  check, artifact references and budget pass, and at least `MIN_RECLAIM` (1024) tokens were reclaimed.
+  A failing summarizer (exception, non-JSON, invalid schema) leaves history untouched and lets the
+  deterministic strategies do the work. Each strategy runs at most once per epoch → no compaction loops.
+- Prompt layout `[system, task, summary?, *history]`: within an epoch history is append-only, so requests are
+  strict prefixes of the next one (`test_prompt_prefix_stability`); across epochs system + task + tools stay
+  identical, so only the part after the first modified message needs prefill.
+- Overflow path: if the provider rejects a request for length, the `emergency` node forces compaction
+  targeting 50% of the current size (the configured window was evidently too optimistic), retried at most
+  `emergency_attempts` (2) times. Bug found by test: the first version targeted the configured low watermark
+  and reclaimed nothing.
+- Tests (unit + graph with scripted LLM): budget/watermarks, masking, stale eviction, pruning protocol
+  validity, pinned task/skills, progress and insufficient-reclaim, summary validation, summarizer failure
+  rollback, early facts surviving two compaction epochs, prefix stability, overflow recovery.
+- Security review finding (run directories in a shared temp dir could expose tool outputs): the run root is
+  now created with mode 0700 and rejected if owned by another user or group/world-accessible.
+- Real run, hybrid, 30k window, seed 0: 11/11 tickets, 44 turns, 376,392 input tokens (95% cached),
+  peak 16,802 — compaction never triggered: output truncation + dedup alone kept the peak below the high
+  watermark (~19k; lazy without the output pipeline peaked at 28.5k). A live compaction test therefore needs
+  an artificially smaller window (16k, labelled as such in results).

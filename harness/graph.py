@@ -7,6 +7,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from harness.config import HarnessConfig
+from harness.context import Candidate, ContextManager, build_prompt
 from harness.protocol import protocol_errors
 from harness.executor import ToolExecutor, ToolOutcome
 from harness.llm import ContextOverflow, LLMClient
@@ -37,6 +38,8 @@ class AgentState(TypedDict):
     turn: int
     request: list[dict]
     request_tokens: int
+    calibration: float
+    overflow_attempts: int
     response: dict
     executor: dict
 
@@ -66,8 +69,17 @@ def parsed_arguments(raw: str) -> dict:
 
 
 def build_request(state: AgentState, config: HarnessConfig) -> list[dict]:
-    return [{"role": "system", "content": system_prompt(mode_name(config))},
-            {"role": "user", "content": state["task"]}, *state["active_messages"]]
+    return build_prompt(system_prompt(mode_name(config)), state["task"], state["summary"], state["active_messages"])
+
+
+def to_candidate(state: AgentState) -> Candidate:
+    return Candidate(state["active_messages"], state["observations"], state["summary"], state["active_skills"],
+                     state["context_epoch"], {})
+
+
+def from_candidate(candidate: Candidate) -> dict:
+    return {"active_messages": candidate.messages, "observations": candidate.observations, "summary": candidate.summary,
+            "active_skills": candidate.active_skills, "context_epoch": candidate.epoch}
 
 
 def budget_status(state: AgentState, run: Run) -> str | None:
@@ -98,8 +110,44 @@ def mark_stale(observations: dict, turn: int, environment_changed: bool) -> dict
 def build_graph(run: Run):
     processor = OutputProcessor(run.config, run.artifacts)
 
+    def context_window_manager(state: AgentState) -> ContextManager:
+        summarize = lambda request: run.llm.complete(request, [], purpose="summarizer")[0]  # noqa: E731
+        return ContextManager(run.config, run.artifacts, system_prompt(mode_name(run.config)), state["task"],
+                              state["active_tools"], summarize, state["completed_actions"])
+
+    def compact(state: AgentState, force: bool) -> tuple[dict, dict]:
+        candidate, report = context_window_manager(state).manage(to_candidate(state), state["calibration"], force)
+        if report["steps"] or report["error"] not in (None, "insufficient_reclaim"):
+            run.events.append("compaction", turn=state["turn"], force=force, **report)
+        if report.get("summarizer_error"):
+            run.metrics.count("summarizer_failures")
+        if candidate is None:
+            return {}, report
+        run.metrics.count("compactions")
+        for strategy, saved in candidate.reclaimed.items():
+            run.metrics.count(f"reclaimed_{strategy}", saved)
+        print(f"🗜️  Compaction epoch {candidate.epoch}: {report['before']} -> {report['after']} tokens "
+              f"({', '.join(step['strategy'] for step in report['steps'])})")
+        return from_candidate(candidate), report
+
     def context_manager(state: AgentState) -> dict:
-        return {}
+        update, report = compact(state, force=False)
+        if report["error"] == "context_budget_exceeded":
+            return {"status": "context_budget_exceeded"}
+        return update
+
+    def route_after_context(state: AgentState) -> Literal["prompt_builder", "__end__"]:
+        return "prompt_builder" if state["status"] == "running" else END
+
+    def emergency(state: AgentState) -> dict:
+        attempts = state["overflow_attempts"] + 1
+        run.metrics.count("emergency_compactions")
+        if attempts > run.config.emergency_attempts:
+            return {"status": "context_budget_exceeded", "overflow_attempts": attempts}
+        update, report = compact(state, force=True)
+        if not update:
+            return {"status": "context_budget_exceeded", "overflow_attempts": attempts}
+        return {**update, "status": "running", "overflow_attempts": attempts}
 
     def prompt_builder(state: AgentState) -> dict:
         request = build_request(state, run.config)
@@ -111,7 +159,7 @@ def build_graph(run: Run):
             content, tool_calls, usage = run.llm.complete(state["request"], state["active_tools"])
         except ContextOverflow as error:
             run.events.append("context_overflow", turn=turn, error=str(error)[:500])
-            return {"turn": turn, "status": "context_overflow"}
+            return {"status": "context_overflow"}
         except (openai.AuthenticationError, openai.PermissionDeniedError) as error:
             run.events.append("fatal_llm_error", turn=turn, error=str(error)[:500])
             return {"turn": turn, "status": "llm_unauthorized"}
@@ -119,10 +167,16 @@ def build_graph(run: Run):
             run.events.append("fatal_llm_error", turn=turn, error=str(error)[:500])
             return {"turn": turn, "status": "llm_unavailable"}
         run.events.append("assistant", turn=turn, content=content, tool_calls=tool_calls, usage=usage)
+        calibration = state["calibration"]
+        if state["request_tokens"] and usage["input"]:
+            calibration = min(max(usage["input"] / state["request_tokens"], 0.8), 1.5)
         print(f"\n{'=' * 60}\n🔄 Turn {turn}\n{'=' * 60}" + (f"\n\n🤖 {content}" if content else ""))
-        return {"turn": turn, "response": {"content": content, "tool_calls": tool_calls}}
+        return {"turn": turn, "response": {"content": content, "tool_calls": tool_calls}, "calibration": calibration,
+                "overflow_attempts": 0}
 
-    def route_after_llm(state: AgentState) -> Literal["tool_router", "final_verification", "__end__"]:
+    def route_after_llm(state: AgentState) -> Literal["tool_router", "final_verification", "emergency", "__end__"]:
+        if state["status"] == "context_overflow":
+            return "emergency"
         if state["status"] != "running":
             return END
         return "tool_router" if state["response"]["tool_calls"] else "final_verification"
@@ -192,6 +246,9 @@ def build_graph(run: Run):
             update["status"] = status
         return update
 
+    def route_after_emergency(state: AgentState) -> Literal["prompt_builder", "__end__"]:
+        return "prompt_builder" if state["status"] == "running" else END
+
     def route_after_update(state: AgentState) -> Literal["context_manager", "__end__"]:
         return "context_manager" if state["status"] == "running" else END
 
@@ -206,10 +263,11 @@ def build_graph(run: Run):
     for name, node in [("context_manager", context_manager), ("prompt_builder", prompt_builder), ("llm", llm),
                        ("tool_router", tool_router), ("tool_executor", tool_executor),
                        ("output_processor", output_processor), ("state_update", state_update),
-                       ("final_verification", final_verification)]:
+                       ("final_verification", final_verification), ("emergency", emergency)]:
         graph.add_node(name, node)
     graph.add_edge(START, "context_manager")
-    graph.add_edge("context_manager", "prompt_builder")
+    graph.add_conditional_edges("context_manager", route_after_context)
+    graph.add_conditional_edges("emergency", route_after_emergency)
     graph.add_edge("prompt_builder", "llm")
     graph.add_conditional_edges("llm", route_after_llm)
     graph.add_edge("tool_router", "tool_executor")
@@ -223,7 +281,8 @@ def build_graph(run: Run):
 def initial_state(task: str, config: HarnessConfig) -> AgentState:
     return AgentState(task=task, constraints=[], active_messages=[], summary={}, observations={}, active_skills={},
                       active_tools=initial_tools(mode_name(config)), completed_actions=[], pending_actions=[],
-                      context_epoch=0, status="running", turn=0, request=[], request_tokens=0, response={},
+                      context_epoch=0, status="running", turn=0, request=[], request_tokens=0, calibration=1.0,
+                      overflow_attempts=0, response={},
                       executor={"environment_version": 0, "failures": {}})
 
 
@@ -231,10 +290,12 @@ def run_agent(task: str, config: HarnessConfig, llm: LLMClient | None = None) ->
     run_dir = new_run_dir()
     run = Run(config=config, events=EventStore(run_dir), artifacts=ArtifactStore(run_dir))
     run.llm = llm or LLMClient(run.metrics, config.llm_retries, config.llm_deadline_seconds)
+    run.llm.metrics = run.metrics
     run.events.append("task", task=task)
     state = build_graph(run).invoke(initial_state(task, config),
                                     {"recursion_limit": 8 * config.max_turns + 20, "configurable": {"thread_id": "run"}})
-    metrics = {"stop_reason": state["status"], "turns": state["turn"], **run.metrics.snapshot(),
+    metrics = {"stop_reason": state["status"], "turns": state["turn"], "context_epochs": state["context_epoch"],
+               **run.metrics.snapshot(),
                "events_path": str(run.events.path)}
     print(f"\n📊 {json.dumps(metrics)}")
     return metrics
