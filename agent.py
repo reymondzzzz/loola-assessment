@@ -64,12 +64,17 @@ def to_openai_tool_call(tool_call_id: str, name: str, arguments: str) -> dict:
     return {"id": tool_call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
 
 
+def to_usage(usage_metadata: dict) -> dict:
+    return {"input": usage_metadata["input_tokens"], "output": usage_metadata["output_tokens"],
+            "cached": usage_metadata.get("input_token_details", {}).get("cache_read", 0)}
+
+
 def call_llm(messages):
     msg = llm.invoke(messages)
     content = msg.text.strip()
     tool_calls = [to_openai_tool_call(tc["id"], tc["name"], json.dumps(tc["args"])) for tc in msg.tool_calls]
     tool_calls += [to_openai_tool_call(tc["id"], tc["name"], tc["args"]) for tc in msg.invalid_tool_calls]
-    return content, tool_calls
+    return content, tool_calls, to_usage(msg.usage_metadata)
 
 
 class AgentState(TypedDict):
@@ -77,15 +82,17 @@ class AgentState(TypedDict):
     turn: int
     content: str
     tool_calls: list[dict]
+    usage: Annotated[list[dict], operator.add]
+    stop_reason: str
 
 
 def llm_node(state: AgentState) -> dict:
     turn = state["turn"] + 1
     print(f"\n{'='*60}\n🔄 Turn {turn}\n{'='*60}")
-    content, tool_calls = call_llm(state["messages"])
+    content, tool_calls, usage = call_llm(state["messages"])
     if content:
         print(f"\n🤖 {content}")
-    return {"turn": turn, "content": content, "tool_calls": tool_calls}
+    return {"turn": turn, "content": content, "tool_calls": tool_calls, "usage": [usage]}
 
 
 def tools_node(state: AgentState) -> dict:
@@ -107,12 +114,12 @@ def tools_node(state: AgentState) -> dict:
 def finish_node(state: AgentState) -> dict:
     print("(no text output)" if not state["content"] else "")
     print("✅ Agent finished")
-    return {}
+    return {"stop_reason": "finished"}
 
 
 def max_turns_node(state: AgentState) -> dict:
     print(f"\n⚠️  Max turns ({MAX_TURNS}) reached. Stopping.")
-    return {}
+    return {"stop_reason": "max_turns"}
 
 
 def route_after_llm(state: AgentState) -> Literal["tools", "finish"]:
@@ -137,12 +144,22 @@ def build_graph():
     return graph.compile()
 
 
-def agent_loop(user_message: str) -> None:
+def summarize_usage(state: AgentState) -> dict:
+    usage = state["usage"]
+    return {"stop_reason": state["stop_reason"], "turns": state["turn"],
+            "input_tokens": sum(u["input"] for u in usage), "output_tokens": sum(u["output"] for u in usage),
+            "cached_tokens": sum(u["cached"] for u in usage), "peak_context": max(u["input"] for u in usage)}
+
+
+def agent_loop(user_message: str) -> dict:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}]
-    build_graph().invoke(
-        {"messages": messages, "turn": 0, "content": "", "tool_calls": []},
+    state = build_graph().invoke(
+        {"messages": messages, "turn": 0, "content": "", "tool_calls": [], "usage": [], "stop_reason": ""},
         {"recursion_limit": 2 * MAX_TURNS + 2},
     )
+    metrics = summarize_usage(state)
+    print(f"\n📊 {json.dumps(metrics)}")
+    return metrics
 
 
 if __name__ == "__main__":

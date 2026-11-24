@@ -12,4 +12,4 @@ dynamic tool/skill loading and context compaction, then benchmark before/after.
 - The first commit holds the unmodified baseline harness; measure "before" against it.
 - Keep the harness a single readable loop; add modules only when a mechanism earns one.
 - Never commit `.env` or API keys.
-- Session logs with the coding agent go in `docs/session-log/`.
+- Record decisions (what, why, evidence) in `docs/DEVLOG.md` as you make them.

@@ -6,3 +6,8 @@ dependencies = [
     "langchain-openai>=1.8.5",
     "langgraph>=1.2.24",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
